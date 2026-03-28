@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "webPort": 10000,
+  "serverPort": 9000,
+  "appServerPort": 4500,
+  "allowedWorkspaces": [
+    "/Users/lipeixu/Code"
+  ],
+  "allowedOrigins": [
+    "http://127.0.0.1:10000",
+    "http://localhost:10000"
+  ]
+}

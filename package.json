@@ -1,0 +1,28 @@
+{
+  "name": "codex-web-local-ui",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/server",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n shared,server,web -c cyan,green,magenta \"npm run dev:shared\" \"npm run dev -w @codex-web/server\" \"npm run dev -w @codex-web/web\"",
+    "dev:shared": "tsc -w -p tsconfig.shared.json",
+    "build": "npm run build:shared && npm run build -w @codex-web/server && npm run build -w @codex-web/web",
+    "build:shared": "tsc -p tsconfig.shared.json",
+    "start": "npm run start -w @codex-web/server",
+    "lint": "npm run lint -w @codex-web/server && npm run lint -w @codex-web/web",
+    "typecheck": "npm run build:shared && npm run typecheck -w @codex-web/server && npm run typecheck -w @codex-web/web"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.24.0",
+    "@openai/codex": "^0.117.0",
+    "@types/node": "^22.14.0",
+    "concurrently": "^9.1.2",
+    "eslint": "^9.24.0",
+    "globals": "^16.0.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.29.0"
+  }
+}

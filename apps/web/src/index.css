@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --sidebar-bg: #1e1e1e;
+  --chat-bg: #0b0b0b;
+  --panel-bg: #252526;
+  --border-color: rgba(255, 255, 255, 0.1);
+  --text-primary: #f3f4f6;
+  --text-secondary: #9ca3af;
+  --accent: #3b82f6;
+  --accent-soft: rgba(59, 130, 246, 0.16);
+  --danger: #ef4444;
+}
+
+.theme-light {
+  --sidebar-bg: #f3f3f3;
+  --chat-bg: #ffffff;
+  --border-color: rgba(0, 0, 0, 0.1);
+  --text-primary: #1f2937;
+  --text-secondary: #4b5563;
+  --panel-bg: #ffffff;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.12);
+}
+
+@layer base {
+  html, body {
+    margin: 0;
+    height: 100%;
+    @apply bg-chat-bg text-text-primary antialiased;
+  }
+
+  #root {
+    height: 100%;
+  }
+
+  /* Custom Scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-500/30 rounded-full hover:bg-gray-500/50 transition-colors;
+  }
+}
+
+.shell-root {
+  @apply bg-chat-bg text-text-primary h-full overflow-hidden;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.glass-panel {
+  @apply bg-white/5 backdrop-blur-md border border-white/10;
+}
+
+.theme-light .glass-panel {
+  @apply bg-black/5 backdrop-blur-md border border-black/10;
+}
+
+
