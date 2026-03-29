@@ -1,31 +1,220 @@
-import { Activity, Shield, TerminalSquare } from "lucide-react";
-import type { SettingsSummary } from "../shared";
+import type { ReactNode } from "react";
+import { Activity, FlaskConical, Package, Settings2, Shield, TerminalSquare, Wrench } from "lucide-react";
+import type { AppServerCatalog, SettingsSummary } from "../shared";
+import { cn } from "../lib/utils";
 
-export function SettingsPanel({ settings }: { settings: SettingsSummary }) {
+type SettingsSection = "overview" | "skills" | "plugins" | "models" | "modes" | "experimental";
+
+interface Props {
+  settings: SettingsSummary;
+  catalog: AppServerCatalog;
+  activeSection: SettingsSection;
+  onSectionChange(section: SettingsSection): void;
+  onRefreshCatalog(): void;
+}
+
+const SECTIONS: Array<{ id: SettingsSection; label: string; icon: typeof Settings2 }> = [
+  { id: "overview", label: "概览", icon: Settings2 },
+  { id: "skills", label: "Skills", icon: Wrench },
+  { id: "plugins", label: "Plugins", icon: Package },
+  { id: "models", label: "Models", icon: Activity },
+  { id: "modes", label: "Modes", icon: TerminalSquare },
+  { id: "experimental", label: "Experimental", icon: FlaskConical }
+];
+
+function SectionCard({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
   return (
     <section className="shell-card p-4">
-      <p className="shell-section-label">Settings</p>
-      <h2 className="mt-2 text-lg font-semibold text-[var(--text-primary)]">本地后端状态</h2>
-      <div className="mt-4 grid gap-3">
-        <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
-          <Activity size={16} className="text-[var(--accent)]" />
-          <div>后端监听: {settings.host}:{settings.serverPort}</div>
-        </div>
-        <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
-          <TerminalSquare size={16} className="text-[var(--accent)]" />
-          <div>前端 {settings.webPort} · app-server {settings.appServerPort}</div>
-        </div>
-        <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
-          <Shield size={16} className="text-[var(--accent)]" />
-          <div>{settings.approvalPolicy} · {settings.sandboxMode}</div>
-        </div>
-        <div className="font-mono text-xs text-[var(--text-secondary)] break-all">
-          codex: {settings.codexCommand} {settings.codexArgs.join(" ")}
-        </div>
-        <div className="text-xs text-[var(--text-secondary)]">
-          来源: {settings.codexCommandSource === "local" ? "项目本地依赖" : settings.codexCommandSource === "explicit" ? "显式配置" : "全局 PATH"}
-        </div>
-      </div>
+      <p className="shell-section-label">{title}</p>
+      <p className="mt-1 text-xs text-[var(--text-secondary)]">{subtitle}</p>
+      <div className="mt-4">{children}</div>
     </section>
+  );
+}
+
+export function SettingsPanel({ settings, catalog, activeSection, onSectionChange, onRefreshCatalog }: Props) {
+  const refreshedAtLabel = catalog.refreshedAt ? new Date(catalog.refreshedAt).toLocaleString() : "尚未刷新";
+  const codexArgs = settings.codexArgs ?? [];
+  const effectiveCodexHomeDir = settings.effectiveCodexHomeDir ?? settings.codexHomeDir ?? "~/.codex";
+  const codexConfigOverrideSources = settings.codexConfigOverrideSources ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap gap-2">
+          {SECTIONS.map((section) => {
+            const Icon = section.icon;
+            return (
+              <button
+                key={section.id}
+                onClick={() => onSectionChange(section.id)}
+                className={cn(
+                  "flex items-center gap-2 rounded-md px-3 py-1.5 text-xs transition-colors",
+                  activeSection === section.id
+                    ? "bg-accent/10 text-accent"
+                    : "bg-white/5 text-[var(--text-secondary)] hover:bg-white/10 hover:text-[var(--text-primary)]"
+                )}
+              >
+                <Icon size={14} />
+                <span>{section.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        <button
+          onClick={onRefreshCatalog}
+          className="rounded-md bg-white/5 px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+        >
+          刷新能力清单
+        </button>
+      </div>
+
+      {activeSection === "overview" ? (
+        <SectionCard title="Settings" subtitle="本地后端与 app-server 状态">
+          <div className="grid gap-3">
+            <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
+              <Activity size={16} className="text-[var(--accent)]" />
+              <div>后端监听: {settings.host}:{settings.serverPort}</div>
+            </div>
+            <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
+              <TerminalSquare size={16} className="text-[var(--accent)]" />
+              <div>前端 {settings.webPort} · app-server {settings.appServerPort}</div>
+            </div>
+            <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
+              <Shield size={16} className="text-[var(--accent)]" />
+              <div>{settings.approvalPolicy} · {settings.sandboxMode}</div>
+            </div>
+            <div className="grid grid-cols-2 gap-3 text-xs text-[var(--text-secondary)]">
+              <div className="shell-card p-3">skills: {catalog.skills.length}</div>
+              <div className="shell-card p-3">plugins: {catalog.plugins.length}</div>
+              <div className="shell-card p-3">models: {catalog.models.length}</div>
+              <div className="shell-card p-3">modes: {catalog.collaborationModes.length}</div>
+            </div>
+            <div className="font-mono text-xs text-[var(--text-secondary)] break-all">
+              codex: {settings.codexCommand} {codexArgs.join(" ")}
+            </div>
+            <div className="text-xs text-[var(--text-secondary)]">
+              来源: {settings.codexCommandSource === "local" ? "项目本地依赖" : settings.codexCommandSource === "explicit" ? "显式配置" : "全局 PATH"}
+            </div>
+            <div className="text-xs text-[var(--text-secondary)] break-all">
+              状态目录: {effectiveCodexHomeDir}
+            </div>
+            <div className="text-xs text-[var(--text-secondary)] break-all">
+              显式 CODEX_HOME: {settings.codexHomeDir ?? "未设置，使用默认 ~/.codex"}
+            </div>
+            <div className="text-xs text-[var(--text-secondary)]">
+              MCP/配置覆盖来源:
+            </div>
+            <div className="space-y-1 text-[10px] text-[var(--text-secondary)]">
+              {codexConfigOverrideSources.length ? (
+                codexConfigOverrideSources.map((source) => (
+                  <div key={source} className="font-mono break-all">
+                    {source}
+                  </div>
+                ))
+              ) : (
+                <div>无额外覆盖配置</div>
+              )}
+            </div>
+            <div className="text-[10px] text-[var(--text-secondary)]">
+              catalog refreshed: {refreshedAtLabel}
+            </div>
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {activeSection === "skills" ? (
+        <SectionCard title="Skills" subtitle={`app-server 当前发现 ${catalog.skills.length} 个 skill`}>
+          <div className="space-y-2">
+            {catalog.skills.map((skill) => (
+              <div key={skill.name} className="shell-card p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium text-[var(--text-primary)]">{skill.displayName}</div>
+                  <div className="text-[10px] uppercase text-[var(--text-secondary)]">{skill.enabled ? "enabled" : "disabled"}</div>
+                </div>
+                <div className="mt-1 text-xs text-[var(--text-secondary)]">${skill.name}</div>
+                <div className="mt-2 text-xs text-[var(--text-secondary)]">{skill.description || "无描述"}</div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {activeSection === "plugins" ? (
+        <SectionCard title="Plugins" subtitle={`app-server 当前发现 ${catalog.plugins.length} 个插件`}>
+          <div className="space-y-2">
+            {catalog.plugins.map((plugin) => (
+              <div key={plugin.id} className="shell-card p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium text-[var(--text-primary)]">{plugin.displayName}</div>
+                  <div className="text-[10px] uppercase text-[var(--text-secondary)]">
+                    {plugin.installed ? "installed" : "available"} · {plugin.enabled ? "enabled" : "disabled"}
+                  </div>
+                </div>
+                <div className="mt-1 text-xs text-[var(--text-secondary)]">{plugin.name}{plugin.category ? ` · ${plugin.category}` : ""}</div>
+                <div className="mt-2 text-xs text-[var(--text-secondary)]">{plugin.description || "无描述"}</div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {activeSection === "models" ? (
+        <SectionCard title="Models" subtitle={`app-server 当前暴露 ${catalog.models.length} 个模型`}>
+          <div className="space-y-2">
+            {catalog.models.map((model) => (
+              <div key={model.id} className="shell-card p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium text-[var(--text-primary)]">{model.displayName}</div>
+                  <div className="text-[10px] uppercase text-[var(--text-secondary)]">
+                    {model.isDefault ? "default" : model.defaultReasoningEffort ?? "-"}
+                  </div>
+                </div>
+                <div className="mt-1 text-xs text-[var(--text-secondary)]">{model.id}</div>
+                <div className="mt-2 text-xs text-[var(--text-secondary)]">{model.description || "无描述"}</div>
+                <div className="mt-2 text-[10px] text-[var(--text-secondary)]">
+                  reasoning: {model.supportedReasoningEfforts.join(", ") || "-"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {activeSection === "modes" ? (
+        <SectionCard title="Modes" subtitle={`app-server 当前暴露 ${catalog.collaborationModes.length} 个协作模式`}>
+          <div className="space-y-2">
+            {catalog.collaborationModes.map((mode) => (
+              <div key={mode.mode} className="shell-card p-3">
+                <div className="font-medium text-[var(--text-primary)]">{mode.name}</div>
+                <div className="mt-1 text-xs text-[var(--text-secondary)]">{mode.mode}</div>
+                <div className="mt-2 text-xs text-[var(--text-secondary)]">
+                  默认 reasoning: {mode.reasoningEffort ?? "-"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {activeSection === "experimental" ? (
+        <SectionCard title="Experimental" subtitle={`app-server 当前暴露 ${catalog.experimentalFeatures.length} 个实验特性`}>
+          <div className="space-y-2">
+            {catalog.experimentalFeatures.map((feature) => (
+              <div key={feature.name} className="shell-card p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium text-[var(--text-primary)]">{feature.displayName}</div>
+                  <div className="text-[10px] uppercase text-[var(--text-secondary)]">
+                    {feature.stage} · {feature.enabled ? "enabled" : "disabled"}
+                  </div>
+                </div>
+                <div className="mt-1 text-xs text-[var(--text-secondary)]">{feature.name}</div>
+                <div className="mt-2 text-xs text-[var(--text-secondary)]">{feature.description || "无描述"}</div>
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      ) : null}
+    </div>
   );
 }

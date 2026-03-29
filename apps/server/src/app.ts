@@ -1,15 +1,18 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import express, { Request, Response } from "express";
 import { WebSocketServer } from "ws";
 import {
   AccountSummary,
+  AppServerCatalog,
   ApprovalRequest,
   ApprovalResolution,
   DiffPreview,
   FrontendEvent,
   LoadedThreadsSummary,
+  McpComposerSuggestions,
   SettingsSummary,
   SnapshotPayload,
   ThreadDetail,
@@ -22,6 +25,7 @@ import { WorkspaceGuard } from "./workspace-guard.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
 import { openSystemBrowser } from "./open-browser.js";
 import { buildDiffPreview } from "./diff-preview.js";
+import { searchSkills, searchWorkspaceFiles } from "./composer.js";
 
 type JsonRpcServerRequest = {
   id: string | number;
@@ -117,6 +121,11 @@ function isThreadNotMaterializedError(error: unknown): boolean {
   return message.includes("is not materialized yet");
 }
 
+function isThreadNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("thread not found");
+}
+
 function parseRateLimits(rateLimits: any) {
   if (!rateLimits) {
     return null;
@@ -141,6 +150,77 @@ function parseRateLimits(rateLimits: any) {
       : null,
     creditsRemaining: rateLimits.credits?.remaining ?? null
   };
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => {
+      setTimeout(() => resolve(fallback), ms);
+    })
+  ]);
+}
+
+function normalizeMcpServerStatusEntries(
+  response: any
+): Array<{
+  name: string;
+  status: string;
+  authStatus: string;
+  description: string;
+  tools: Array<{ name: string; description: string }>;
+  resources: number;
+  resourceTemplates: number;
+}> {
+  const rawEntries = response?.data ?? response?.servers ?? response?.items ?? [];
+  if (!Array.isArray(rawEntries)) {
+    return [];
+  }
+
+  return rawEntries
+    .map((entry: any) => {
+      const name = String(
+        entry?.name ?? entry?.server ?? entry?.serverName ?? entry?.id ?? entry?.slug ?? ""
+      ).trim();
+      if (!name) {
+        return null;
+      }
+      const status = String(entry?.status ?? entry?.state ?? entry?.connectionStatus ?? "unknown");
+      const authStatus = String(entry?.authStatus ?? entry?.auth?.status ?? entry?.authenticationStatus ?? "unknown");
+      const description = String(
+        entry?.description ?? entry?.message ?? entry?.detail ?? entry?.error ?? ""
+      ).trim();
+      const tools = Array.isArray(entry?.tools)
+        ? entry.tools
+            .map((tool: any) => {
+              const toolName = String(tool?.name ?? tool?.id ?? "").trim();
+              if (!toolName) {
+                return null;
+              }
+              return {
+                name: toolName,
+                description: String(tool?.description ?? tool?.title ?? tool?.summary ?? "").trim()
+              };
+            })
+            .filter(Boolean)
+        : [];
+      const resources = Array.isArray(entry?.resources) ? entry.resources.length : 0;
+      const resourceTemplates = Array.isArray(entry?.resourceTemplates)
+        ? entry.resourceTemplates.length
+        : Array.isArray(entry?.resource_templates)
+          ? entry.resource_templates.length
+          : 0;
+      return { name, status, authStatus, description, tools, resources, resourceTemplates };
+    })
+    .filter(Boolean) as Array<{
+      name: string;
+      status: string;
+      authStatus: string;
+      description: string;
+      tools: Array<{ name: string; description: string }>;
+      resources: number;
+      resourceTemplates: number;
+    }>;
 }
 
 export function createApp() {
@@ -178,6 +258,14 @@ export function createApp() {
     loadedThreadIds: [],
     refreshedAt: 0
   };
+  let appServerCatalog: AppServerCatalog = {
+    skills: [],
+    plugins: [],
+    models: [],
+    collaborationModes: [],
+    experimentalFeatures: [],
+    refreshedAt: 0
+  };
   const turnStatusByThread = new Map<string, ThreadSummary["status"]>();
   const turnDiffs = new Map<string, string>();
   const pendingApprovals = new Map<string, ApprovalRequest>();
@@ -211,6 +299,8 @@ export function createApp() {
       codexCommandSource: appConfig.codexCommandSource,
       codexArgs: appConfig.codexArgs,
       codexHomeDir: appConfig.codexHomeDir,
+      effectiveCodexHomeDir: appConfig.codexHomeDir ?? path.join(os.homedir(), ".codex"),
+      codexConfigOverrideSources: appConfig.codexConfigOverrideSources,
       appServerConnected: status.connected,
       appServerStatus: status.status
     };
@@ -223,7 +313,8 @@ export function createApp() {
       threads: Array.from(threads.values()).sort((a, b) => b.updatedAt - a.updatedAt),
       loadedThreads,
       approvals: Array.from(pendingApprovals.values()).filter((entry) => entry.status === "pending"),
-      settings: settingsSummary()
+      settings: settingsSummary(),
+      appServerCatalog
     };
   }
 
@@ -310,6 +401,183 @@ export function createApp() {
     return Array.from(latestThreads.values()).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
+  async function refreshAppServerCatalog(): Promise<AppServerCatalog> {
+    const [skillsResponse, pluginsResponse, modelsResponse, collaborationModesResponse, experimentalFeaturesResponse] =
+      await Promise.all([
+        client.request<any>("skills/list", {}),
+        client.request<any>("plugin/list", {}),
+        client.request<any>("model/list", {}),
+        client.request<any>("collaborationMode/list", {}),
+        client.request<any>("experimentalFeature/list", {})
+      ]);
+
+    const skills = (skillsResponse?.data ?? []).flatMap((entry: any) =>
+      (entry.skills ?? []).map((skill: any) => ({
+        name: String(skill.name ?? ""),
+        displayName: String(skill.interface?.displayName ?? skill.name ?? ""),
+        description: String(skill.interface?.shortDescription ?? skill.description ?? ""),
+        enabled: Boolean(skill.enabled)
+      }))
+    );
+
+    const plugins = (pluginsResponse?.marketplaces ?? []).flatMap((marketplace: any) =>
+      (marketplace.plugins ?? []).map((plugin: any) => ({
+        id: String(plugin.id ?? ""),
+        name: String(plugin.name ?? ""),
+        displayName: String(plugin.interface?.displayName ?? plugin.name ?? ""),
+        description: String(plugin.interface?.shortDescription ?? plugin.interface?.longDescription ?? ""),
+        category: typeof plugin.interface?.category === "string" ? plugin.interface.category : null,
+        installed: Boolean(plugin.installed),
+        enabled: Boolean(plugin.enabled)
+      }))
+    );
+
+    const models = (modelsResponse?.data ?? []).map((model: any) => ({
+      id: String(model.id ?? model.model ?? ""),
+      displayName: String(model.displayName ?? model.model ?? model.id ?? ""),
+      description: String(model.description ?? ""),
+      defaultReasoningEffort:
+        typeof model.defaultReasoningEffort === "string" ? model.defaultReasoningEffort : null,
+      supportedReasoningEfforts: (model.supportedReasoningEfforts ?? [])
+        .map((entry: any) => String(entry.reasoningEffort ?? ""))
+        .filter(Boolean),
+      isDefault: Boolean(model.isDefault)
+    }));
+
+    const collaborationModes = (collaborationModesResponse?.data ?? []).map((mode: any) => ({
+      name: String(mode.name ?? mode.mode ?? ""),
+      mode: String(mode.mode ?? ""),
+      reasoningEffort: typeof mode.reasoning_effort === "string" ? mode.reasoning_effort : null
+    }));
+
+    const experimentalFeatures = (experimentalFeaturesResponse?.data ?? []).map((feature: any) => ({
+      name: String(feature.name ?? ""),
+      displayName: String(feature.displayName ?? feature.name ?? ""),
+      description: String(feature.description ?? feature.announcement ?? ""),
+      stage: String(feature.stage ?? "unknown"),
+      enabled: Boolean(feature.enabled),
+      defaultEnabled: Boolean(feature.defaultEnabled)
+    }));
+
+    appServerCatalog = {
+      skills,
+      plugins,
+      models,
+      collaborationModes,
+      experimentalFeatures,
+      refreshedAt: Date.now()
+    };
+    return appServerCatalog;
+  }
+
+  async function listMcpServerStatusRaw(): Promise<any> {
+    const pages: any[] = [];
+    let cursor: string | null = null;
+
+    for (let index = 0; index < 10; index += 1) {
+      const response: any = await withTimeout(
+        client.request<any>("mcpServerStatus/list", { limit: 100, cursor }),
+        2500,
+        null
+      ).catch(() => null);
+      if (!response) {
+        break;
+      }
+      pages.push(response);
+      const nextCursor: string | null =
+        typeof response.nextCursor === "string"
+          ? response.nextCursor
+          : typeof response.next_cursor === "string"
+            ? response.next_cursor
+            : null;
+      if (!nextCursor) {
+        break;
+      }
+      cursor = nextCursor;
+    }
+
+    return {
+      data: pages.flatMap((page) => {
+        const entries = page?.data ?? page?.servers ?? page?.items ?? [];
+        return Array.isArray(entries) ? entries : [];
+      }),
+      pages
+    };
+  }
+
+  async function listMcpServers(): Promise<
+    Array<{
+      name: string;
+      status: string;
+      authStatus: string;
+      description: string;
+      tools: Array<{ name: string; description: string }>;
+      resources: number;
+      resourceTemplates: number;
+    }>
+  > {
+    const response = await listMcpServerStatusRaw();
+    return normalizeMcpServerStatusEntries(response);
+  }
+
+  async function searchMcpComposerSuggestions(query: string): Promise<McpComposerSuggestions> {
+    const normalizedQuery = query.trimStart();
+    const matched = /^\/mcp(?:\s+([^\s]+))?(?:\s+(.*))?$/i.exec(normalizedQuery);
+    const serverQuery = matched?.[1] ?? "";
+    const toolQuery = matched?.[2]?.trim() ?? "";
+    const hasTrailingServerSpace = /^\/mcp\s+[^\s]+\s+$/i.test(normalizedQuery);
+
+    const servers = await listMcpServers();
+    const toServerSuggestion = (entry: (typeof servers)[number]) => ({
+      name: entry.name,
+      status: entry.status,
+      description:
+        entry.description ||
+        `auth=${entry.authStatus} · tools=${entry.tools.length} · resources=${entry.resources} · templates=${entry.resourceTemplates}`
+    });
+
+    if (!serverQuery) {
+      return {
+        mode: "servers",
+        servers: servers
+          .filter((entry) => entry.name.toLowerCase().includes(toolQuery.toLowerCase()))
+          .map(toServerSuggestion),
+        tools: []
+      };
+    }
+
+    const matchedServers = servers.filter((entry) => entry.name.toLowerCase().includes(serverQuery.toLowerCase()));
+    const selectedServer =
+      servers.find((entry) => entry.name === serverQuery) ??
+      (matchedServers.length === 1 ? matchedServers[0] : null);
+
+    if (!selectedServer || (!toolQuery && !hasTrailingServerSpace && !servers.some((entry) => entry.name === serverQuery))) {
+      return {
+        mode: "servers",
+        servers: matchedServers.map(toServerSuggestion),
+        tools: []
+      };
+    }
+
+    const normalizedToolQuery = toolQuery.toLowerCase();
+    return {
+      mode: "tools",
+      servers: [toServerSuggestion(selectedServer)],
+      tools: selectedServer.tools
+        .map((entry) => ({
+          server: selectedServer.name,
+          name: entry.name,
+          description: entry.description
+        }))
+        .filter((entry) => {
+          if (!normalizedToolQuery) {
+            return true;
+          }
+          return `${entry.name} ${entry.description}`.toLowerCase().includes(normalizedToolQuery);
+        })
+    };
+  }
+
   function requireOrigin(req: Request, res: Response): boolean {
     const origin = req.headers.origin;
     if (!isOriginAllowed(origin)) {
@@ -325,6 +593,20 @@ export function createApp() {
       return;
     }
     await client.start();
+  }
+
+  async function resumeThread(threadId: string): Promise<boolean> {
+    try {
+      await client.request("thread/resume", { threadId });
+      await refreshThreads().catch(() => undefined);
+      return true;
+    } catch (error) {
+      logger.log("thread.resume.failed", {
+        threadId,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      return false;
+    }
   }
 
   client.on("status", (status) => {
@@ -549,6 +831,7 @@ export function createApp() {
     await ensureClientReady();
     await refreshAccount();
     await refreshThreads();
+    await refreshAppServerCatalog().catch(() => appServerCatalog);
     res.json(snapshot());
   });
 
@@ -642,6 +925,83 @@ export function createApp() {
     res.json(loadedThreads);
   });
 
+  app.get("/api/composer/files", (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    const cwd = workspaceGuard.getCurrentWorkspace();
+    if (!cwd) {
+      res.status(400).json({ error: "请先选择白名单内的工作目录" });
+      return;
+    }
+    try {
+      const query = String(req.query.query ?? "");
+      res.json(searchWorkspaceFiles(cwd, query));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/composer/skills", (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    try {
+      const query = String(req.query.query ?? "");
+      res.json(searchSkills(query, appConfig.codexHomeDir));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/composer/mcp", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    try {
+      const query = String(req.query.query ?? "");
+      const payload = await searchMcpComposerSuggestions(query);
+      logger.log("composer.mcp.query", {
+        query,
+        mode: payload.mode,
+        serverCount: payload.servers.length,
+        toolCount: payload.tools.length
+      });
+      res.json(payload);
+    } catch (error) {
+      logger.log("composer.mcp.failed", {
+        query: String(req.query.query ?? ""),
+        message: error instanceof Error ? error.message : String(error)
+      });
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/debug/mcp-status", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    try {
+      res.json(await listMcpServerStatusRaw());
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/app-server/catalog", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    try {
+      res.json(await refreshAppServerCatalog());
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post("/api/threads", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
@@ -706,11 +1066,31 @@ export function createApp() {
       return;
     }
     logger.log("prompt.submitted", { threadId: req.params.threadId, cwd, prompt });
-    const response = await client.request<any>("turn/start", {
-      threadId: req.params.threadId,
-      cwd,
-      input: [{ type: "text", text: prompt, text_elements: [] }]
-    });
+    const threadId = req.params.threadId;
+    const startTurn = () =>
+      client.request<any>("turn/start", {
+        threadId,
+        cwd,
+        input: [{ type: "text", text: prompt, text_elements: [] }]
+      });
+
+    if (!loadedThreads.loadedThreadIds.includes(threadId)) {
+      await resumeThread(threadId);
+    }
+
+    let response;
+    try {
+      response = await startTurn();
+    } catch (error) {
+      if (!isThreadNotFoundError(error)) {
+        throw error;
+      }
+      const resumed = await resumeThread(threadId);
+      if (!resumed) {
+        throw error;
+      }
+      response = await startTurn();
+    }
     res.json({ turnId: response.turn.id });
   });
 
@@ -819,18 +1199,6 @@ export function createApp() {
   });
 
   const start = async () => {
-    try {
-      await client.start();
-      await refreshAccount();
-      await refreshThreads();
-    } catch (error) {
-      logger.log("error.app_server.init", {
-        message:
-          error instanceof Error
-            ? error.message
-            : "无法初始化 codex app-server，请确认 codex 已安装且可执行"
-      });
-    }
     server.on("error", (error) => {
       logger.log("error.server.listen", {
         message: error instanceof Error ? error.message : String(error),
@@ -838,12 +1206,31 @@ export function createApp() {
         port: appConfig.serverPort
       });
     });
-    server.listen(appConfig.serverPort, appConfig.host, () => {
-      logger.log("server.started", {
-        host: appConfig.host,
-        port: appConfig.serverPort
+
+    await new Promise<void>((resolve) => {
+      server.listen(appConfig.serverPort, appConfig.host, () => {
+        logger.log("server.started", {
+          host: appConfig.host,
+          port: appConfig.serverPort
+        });
+        resolve();
       });
     });
+
+    void (async () => {
+      try {
+        await client.start();
+        await refreshAccount();
+        await refreshThreads();
+      } catch (error) {
+        logger.log("error.app_server.init", {
+          message:
+            error instanceof Error
+              ? error.message
+              : "无法初始化 codex app-server，请确认 codex 已安装且可执行"
+        });
+      }
+    })();
   };
 
   return { app, start };

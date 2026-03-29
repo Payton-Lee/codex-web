@@ -1,13 +1,17 @@
 import type {
   AccountSummary,
+  AppServerCatalog,
   ApprovalRequest,
   ApprovalResolution,
   DiffPreview,
   LoadedThreadsSummary,
+  McpComposerSuggestions,
+  SkillSuggestion,
   SettingsSummary,
   SnapshotPayload,
   ThreadDetail,
   ThreadSummary,
+  WorkspaceFileSuggestion,
   WorkspaceState
 } from "./shared";
 
@@ -51,6 +55,13 @@ export const api = {
   loadedThreads: () => request<LoadedThreadsSummary>("/api/threads/loaded"),
   createThread: () => request<ThreadSummary>("/api/threads", { method: "POST" }),
   threadDetail: (threadId: string) => request<ThreadDetail>(`/api/threads/${threadId}`),
+  searchComposerFiles: (query: string) =>
+    request<WorkspaceFileSuggestion[]>(`/api/composer/files?query=${encodeURIComponent(query)}`),
+  searchComposerSkills: (query: string) =>
+    request<SkillSuggestion[]>(`/api/composer/skills?query=${encodeURIComponent(query)}`),
+  searchComposerMcp: (query: string) =>
+    request<McpComposerSuggestions>(`/api/composer/mcp?query=${encodeURIComponent(query)}`),
+  appServerCatalog: () => request<AppServerCatalog>("/api/app-server/catalog"),
   sendPrompt: (threadId: string, prompt: string) =>
     request<{ turnId: string }>(`/api/threads/${threadId}/turns`, {
       method: "POST",

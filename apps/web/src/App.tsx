@@ -23,17 +23,20 @@ import { WorkspaceSelector } from "./components/WorkspaceSelector";
 import { useAppStore } from "./store";
 import { cn } from "./lib/utils";
 import { isThreadInWorkspace } from "./lib/workspace";
+import type { SlashCommandId } from "./lib/composer";
 
 type RightTab = "diff" | "approvals" | "settings";
 type LeftTab = "threads" | "workspace" | "account" | "files" | null;
 type ThemeMode = "dark" | "light";
 type LanguageMode = "zh" | "en";
+type SettingsSection = "overview" | "skills" | "plugins" | "models" | "modes" | "experimental";
 
 export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>("diff");
   const [leftTab, setLeftTab] = useState<LeftTab>("threads");
   const [theme, setTheme] = useState<ThemeMode>("dark");
   const [language, setLanguage] = useState<LanguageMode>("zh");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("overview");
   const {
     loading,
     error,
@@ -41,12 +44,14 @@ export default function App() {
     approvalHistory,
     selectedThreadId,
     threadDetail,
+    threadDetailRefreshing,
     liveDeltas,
     pendingPrompt,
     bootstrap,
     selectThread,
     createThread,
     refreshLoadedThreads,
+    refreshAppServerCatalog,
     sendPrompt,
     interruptTurn,
     addWorkspace,
@@ -139,6 +144,49 @@ export default function App() {
     setLeftTab((prev) => (prev === tab ? null : tab));
   };
 
+  const handleSlashCommand = (command: SlashCommandId) => {
+    if (command === "new") {
+      void createThread();
+      return;
+    }
+    if (command === "approvals") {
+      setRightTab("approvals");
+      return;
+    }
+    if (command === "diff") {
+      setRightTab("diff");
+      return;
+    }
+    if (command === "settings") {
+      setRightTab("settings");
+      setSettingsSection("overview");
+      return;
+    }
+    if (command === "plugins") {
+      setRightTab("settings");
+      setSettingsSection("plugins");
+      return;
+    }
+    if (command === "models") {
+      setRightTab("settings");
+      setSettingsSection("models");
+      return;
+    }
+    if (command === "modes") {
+      setRightTab("settings");
+      setSettingsSection("modes");
+      return;
+    }
+    if (command === "experimental") {
+      setRightTab("settings");
+      setSettingsSection("experimental");
+      return;
+    }
+    if (command === "runtime" || command === "compact") {
+      return;
+    }
+  };
+
   if (loading && !snapshot) {
     return <div className="flex h-screen w-full items-center justify-center bg-chat-bg text-sm text-text-secondary">启动中...</div>;
   }
@@ -166,10 +214,6 @@ export default function App() {
   const workspaceThreads = currentWorkspace
     ? snapshot.threads.filter((thread) => isThreadInWorkspace(thread.cwd, currentWorkspace))
     : snapshot.threads;
-  const visibleThreadDetail =
-    !currentWorkspace || !threadDetail || isThreadInWorkspace(threadDetail.cwd, currentWorkspace) ? threadDetail : null;
-  const visibleSelectedThreadId =
-    !currentWorkspace || !threadDetail || isThreadInWorkspace(threadDetail.cwd, currentWorkspace) ? selectedThreadId : null;
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-chat-bg text-text-primary theme-transition">
@@ -222,7 +266,10 @@ export default function App() {
           
           <div className="mt-auto flex flex-col gap-4">
             <button 
-              onClick={() => setRightTab("settings")}
+              onClick={() => {
+                setRightTab("settings");
+                setSettingsSection("overview");
+              }}
               className="p-2 text-text-secondary hover:text-text-primary transition-colors"
               title={t.tabs.settings}
             >
@@ -257,7 +304,7 @@ export default function App() {
                   threads={workspaceThreads}
                   loadedThreadIds={snapshot.loadedThreads.loadedThreadIds}
                   loadedRefreshedAt={snapshot.loadedThreads.refreshedAt}
-                  selectedThreadId={visibleSelectedThreadId}
+                  selectedThreadId={selectedThreadId}
                   onCreate={() => void createThread()}
                   onRefreshLatest={() => void refreshLoadedThreads()}
                   onSelect={(threadId) => void selectThread(threadId)}
@@ -351,18 +398,24 @@ export default function App() {
           
             <div className="flex-1 min-w-0 flex flex-col">
               <ChatView
-                detail={visibleThreadDetail}
+                detail={threadDetail}
                 liveDeltas={liveDeltas}
                 pendingPrompt={
-                  pendingPrompt && pendingPrompt.threadId === (threadDetail?.id ?? selectedThreadId)
+                  pendingPrompt && pendingPrompt.threadId === selectedThreadId
                     ? pendingPrompt.prompt
                     : null
                 }
-                onSend={(prompt) => void sendPrompt(prompt)}
-                onInterrupt={() => void interruptTurn()}
-              language={language}
-              workspaceName={projectName}
-            />
+                detailRefreshing={threadDetailRefreshing}
+                onSend={sendPrompt}
+                onInterrupt={() => {
+                  void interruptTurn();
+                }}
+                onSlashCommand={handleSlashCommand}
+                language={language}
+                workspaceName={projectName}
+                canSend={Boolean(selectedThreadId)}
+                appServerCatalog={snapshot.appServerCatalog}
+              />
           </div>
 
           <aside className="hidden xl:flex w-[42%] flex-shrink-0 bg-sidebar border-l border-border flex-col shadow-inner min-w-0">
@@ -392,7 +445,10 @@ export default function App() {
                    "flex items-center gap-2 px-3 py-1.5 rounded text-xs whitespace-nowrap transition-colors",
                    rightTab === "settings" ? "bg-accent/10 text-accent" : "text-text-secondary hover:bg-white/5 hover:text-text-primary"
                 )}
-                onClick={() => setRightTab("settings")}
+                onClick={() => {
+                  setRightTab("settings");
+                  setSettingsSection("overview");
+                }}
               >
                 <Settings size={14} />
                 <span>{t.tabs.settings}</span>
@@ -408,7 +464,15 @@ export default function App() {
                   onResolve={(id, payload) => void resolveApproval(id, payload)}
                 />
               ) : null}
-              {rightTab === "settings" ? <SettingsPanel settings={snapshot.settings} /> : null}
+              {rightTab === "settings" ? (
+                <SettingsPanel
+                  settings={snapshot.settings}
+                  catalog={snapshot.appServerCatalog}
+                  activeSection={settingsSection}
+                  onSectionChange={setSettingsSection}
+                  onRefreshCatalog={() => void refreshAppServerCatalog()}
+                />
+              ) : null}
             </div>
           </aside>
           

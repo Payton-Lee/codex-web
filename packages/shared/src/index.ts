@@ -156,6 +156,8 @@ export interface SettingsSummary {
   codexCommandSource: "explicit" | "local" | "global";
   codexArgs: string[];
   codexHomeDir?: string;
+  effectiveCodexHomeDir: string;
+  codexConfigOverrideSources: string[];
   appServerConnected: boolean;
   appServerStatus: string;
 }
@@ -164,6 +166,125 @@ export interface LoadedThreadsSummary {
   loadedThreadIds: string[];
   refreshedAt: number;
 }
+
+export interface PromptCommandDefinition {
+  id: string;
+  title: string;
+  description: string;
+  instruction: string;
+}
+
+export interface WorkspaceFileSuggestion {
+  path: string;
+}
+
+export interface SkillSuggestion {
+  id: string;
+  name: string;
+  path: string;
+  description: string;
+}
+
+export interface AppServerSkillSummary {
+  name: string;
+  displayName: string;
+  description: string;
+  enabled: boolean;
+}
+
+export interface AppServerPluginSummary {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  category: string | null;
+  installed: boolean;
+  enabled: boolean;
+}
+
+export interface AppServerModelSummary {
+  id: string;
+  displayName: string;
+  description: string;
+  defaultReasoningEffort: string | null;
+  supportedReasoningEfforts: string[];
+  isDefault: boolean;
+}
+
+export interface AppServerCollaborationModeSummary {
+  name: string;
+  mode: string;
+  reasoningEffort: string | null;
+}
+
+export interface AppServerExperimentalFeatureSummary {
+  name: string;
+  displayName: string;
+  description: string;
+  stage: string;
+  enabled: boolean;
+  defaultEnabled: boolean;
+}
+
+export interface AppServerCatalog {
+  skills: AppServerSkillSummary[];
+  plugins: AppServerPluginSummary[];
+  models: AppServerModelSummary[];
+  collaborationModes: AppServerCollaborationModeSummary[];
+  experimentalFeatures: AppServerExperimentalFeatureSummary[];
+  refreshedAt: number;
+}
+
+export interface McpServerSuggestion {
+  name: string;
+  status: string;
+  description: string;
+}
+
+export interface McpToolSuggestion {
+  server: string;
+  name: string;
+  description: string;
+}
+
+export interface McpComposerSuggestions {
+  mode: "servers" | "tools";
+  servers: McpServerSuggestion[];
+  tools: McpToolSuggestion[];
+}
+
+export const PROMPT_COMMANDS: PromptCommandDefinition[] = [
+  {
+    id: "fix",
+    title: "修复问题",
+    description: "直接定位并修复问题，必要时补验证。",
+    instruction: "请直接定位并修复问题，优先给出可执行修改，并在可行时运行必要验证。"
+  },
+  {
+    id: "review",
+    title: "代码审查",
+    description: "按代码审查方式找风险、回归和缺失测试。",
+    instruction: "请按代码审查方式处理，优先指出 bug、风险、行为回归和缺失测试，结论按严重程度排序。"
+  },
+  {
+    id: "explain",
+    title: "解释代码",
+    description: "解释实现、调用链和关键设计。",
+    instruction: "请解释相关代码的实现、调用链和关键设计取舍，优先帮助快速理解。"
+  },
+  {
+    id: "test",
+    title: "补测试",
+    description: "围绕当前需求补测试并说明覆盖范围。",
+    instruction: "请围绕当前需求补充或修正测试，并说明覆盖到的行为与仍未覆盖的风险。"
+  },
+  {
+    id: "plan",
+    title: "实现方案",
+    description: "先梳理方案、拆分步骤和风险。",
+    instruction: "请先给出精炼可执行的实现方案，拆分主要步骤、依赖和风险，再开始修改。"
+  }
+] as const;
 
 export type FrontendEvent =
   | { type: "snapshot"; payload: SnapshotPayload }
@@ -212,4 +333,5 @@ export interface SnapshotPayload {
   loadedThreads: LoadedThreadsSummary;
   approvals: ApprovalRequest[];
   settings: SettingsSummary;
+  appServerCatalog: AppServerCatalog;
 }

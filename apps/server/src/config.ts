@@ -23,6 +23,44 @@ function parseList(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
+function expandTomlOverrideFile(filePath: string): string[] {
+  const content = fs.readFileSync(filePath, "utf8");
+  const overrides: string[] = [];
+  let sectionPath: string[] = [];
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const sectionMatch = line.match(/^\[(.+)\]$/);
+    if (sectionMatch) {
+      sectionPath = sectionMatch[1]
+        .split(".")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      continue;
+    }
+
+    const equalIndex = line.indexOf("=");
+    if (equalIndex === -1) {
+      continue;
+    }
+
+    const key = line.slice(0, equalIndex).trim();
+    const value = line.slice(equalIndex + 1).trim();
+    if (!key || !value) {
+      continue;
+    }
+
+    const dottedKey = [...sectionPath, key].join(".");
+    overrides.push(`${dottedKey}=${value}`);
+  }
+
+  return overrides;
+}
+
 function existingPath(candidates: string[]): string | null {
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
@@ -102,6 +140,25 @@ const allowedOrigins = parseList(process.env.ALLOWED_ORIGINS).length
     ? fileConfig.allowedOrigins
     : [`http://${host}:${webPort}`, `http://localhost:${webPort}`];
 
+const codexConfigOverrideEntries = parseList(process.env.CODEX_CONFIG_OVERRIDES)
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const codexConfigOverrideSources = codexConfigOverrideEntries.map((entry) => {
+  const resolvedPath = path.resolve(rootDir, entry);
+  if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
+    return resolvedPath;
+  }
+  return entry;
+});
+const codexConfigOverrides = codexConfigOverrideEntries.flatMap((entry) => {
+  const resolvedPath = path.resolve(rootDir, entry);
+  if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
+    return expandTomlOverrideFile(resolvedPath);
+  }
+
+  return [entry];
+});
+
 export const appConfig = {
   configFilePath,
   host,
@@ -117,7 +174,8 @@ export const appConfig = {
   codexHomeDir: process.env.CODEX_HOME_DIR
     ? path.resolve(process.env.CODEX_HOME_DIR)
     : undefined,
-  codexConfigOverrides: parseList(process.env.CODEX_CONFIG_OVERRIDES),
+  codexConfigOverrideSources,
+  codexConfigOverrides,
   allowedWorkspaces,
   defaultWorkspace,
   allowedOrigins,
