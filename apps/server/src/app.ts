@@ -136,16 +136,20 @@ function parseRateLimits(rateLimits: any) {
       ? {
           used: rateLimits.primary.used ?? null,
           limit: rateLimits.primary.limit ?? null,
+          usedPercent: rateLimits.primary.usedPercent ?? null,
           resetsAt: rateLimits.primary.resetsAt ?? null,
-          windowSeconds: rateLimits.primary.windowSeconds ?? null
+          windowSeconds: rateLimits.primary.windowSeconds ?? null,
+          windowDurationMins: rateLimits.primary.windowDurationMins ?? null
         }
       : null,
     secondary: rateLimits.secondary
       ? {
           used: rateLimits.secondary.used ?? null,
           limit: rateLimits.secondary.limit ?? null,
+          usedPercent: rateLimits.secondary.usedPercent ?? null,
           resetsAt: rateLimits.secondary.resetsAt ?? null,
-          windowSeconds: rateLimits.secondary.windowSeconds ?? null
+          windowSeconds: rateLimits.secondary.windowSeconds ?? null,
+          windowDurationMins: rateLimits.secondary.windowDurationMins ?? null
         }
       : null,
     creditsRemaining: rateLimits.credits?.remaining ?? null
@@ -779,7 +783,7 @@ export function createApp() {
       return;
     }
 
-    const requestId = String(message.id);
+    const requestId = message.id;
     const params = message.params ?? {};
     const approval: ApprovalRequest = {
       id: crypto.randomUUID(),

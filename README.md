@@ -10,6 +10,23 @@
 
 这意味着如果你在当前仓库里安装了较新的 `@openai/codex`，`codex-web` 会优先使用它，而不是误命中系统里的旧版全局 `codex`。
 
+## 协议参考
+
+仓库内已整理了 `app-server` 的本地参考文档，后续开发建议优先查这两份：
+
+- 接口索引（只列接口名称和分类）：
+  - [docs/protocol/app-server-interface-index.md](/Users/lipeixu/Code/codex-web/docs/protocol/app-server-interface-index.md)
+- 工程参考（保留关键说明、事件和注意点）：
+  - [docs/protocol/app-server-reference.md](/Users/lipeixu/Code/codex-web/docs/protocol/app-server-reference.md)
+
+如果需要更完整的字段说明、示例和兼容性说明，再回官方 README 或本地生成 schema：
+
+- 官方 README：
+  - https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
+- 本地 schema / TS：
+  - `generated/schema`
+  - `generated/ts`
+
 ## 配置文件
 
 新增根目录配置文件 [codex-web.config.json](/Users/lipeixu/Code/codex-web/codex-web.config.json)，作为默认配置源；`.env` 用于覆盖它。

@@ -14,8 +14,10 @@ export type AccountMode = "chatgpt" | "apiKey" | "unknown";
 export interface RateLimitWindowSummary {
   used?: number | null;
   limit?: number | null;
+  usedPercent?: number | null;
   resetsAt?: number | null;
   windowSeconds?: number | null;
+  windowDurationMins?: number | null;
 }
 
 export interface RateLimitSummary {

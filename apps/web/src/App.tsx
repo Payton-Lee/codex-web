@@ -211,6 +211,29 @@ export default function App() {
   const workspaceLabel = currentWorkspace ?? threadDetail?.cwd;
   const projectName = workspaceLabel ? workspaceLabel.split("/").pop() : t.notSelected;
   const accountName = snapshot.account.email?.split("@")[0] || "Codex User";
+  const rateLimits = snapshot.account.rateLimits;
+  const formatResetAt = (resetsAt?: number | null) =>
+    resetsAt ? new Date(resetsAt * 1000).toLocaleString("zh-CN") : null;
+  const formatRateLimitWindow = (
+    window?: {
+      used?: number | null;
+      limit?: number | null;
+      usedPercent?: number | null;
+      resetsAt?: number | null;
+    } | null
+  ) => {
+    if (!window) {
+      return "-";
+    }
+    if (window.usedPercent != null) {
+      return `${Math.max(0, 100 - window.usedPercent)}%`;
+    }
+    if (window.used != null && window.limit != null) {
+      return `${window.used}/${window.limit}`;
+    }
+    const resetLabel = formatResetAt(window.resetsAt);
+    return resetLabel ? `重置于 ${resetLabel}` : "-";
+  };
   const workspaceThreads = currentWorkspace
     ? snapshot.threads.filter((thread) => isThreadInWorkspace(thread.cwd, currentWorkspace))
     : snapshot.threads;
@@ -337,6 +360,11 @@ export default function App() {
                     <div className="mt-4 space-y-2 text-xs text-text-secondary mb-4 pb-4 border-b border-border">
                        <div className="flex justify-between"><span>{t.accountMode}:</span> <span>{snapshot.account.mode}</span></div>
                        <div className="flex justify-between"><span>{t.accountPlan}:</span> <span>{snapshot.account.planType ?? "-"}</span></div>
+                       <div className="flex justify-between"><span>主额度:</span> <span>{formatRateLimitWindow(rateLimits?.primary)}</span></div>
+                       <div className="flex justify-between"><span>主额度重置:</span> <span>{formatResetAt(rateLimits?.primary?.resetsAt) ?? "-"}</span></div>
+                       <div className="flex justify-between"><span>副额度:</span> <span>{formatRateLimitWindow(rateLimits?.secondary)}</span></div>
+                       <div className="flex justify-between"><span>副额度重置:</span> <span>{formatResetAt(rateLimits?.secondary?.resetsAt) ?? "-"}</span></div>
+                       <div className="flex justify-between"><span>Credits:</span> <span>{rateLimits?.creditsRemaining ?? "-"}</span></div>
                     </div>
 
                     {snapshot.account.loggedIn ? (
