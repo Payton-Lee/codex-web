@@ -1,0 +1,30 @@
+appId: com.paytonlee.codexweb
+productName: Codex Web
+directories:
+  output: ../../dist-desktop
+files:
+  - dist/**/*
+  - bundle/server/**/*
+  - package.json
+extraResources:
+  - from: bundle/web
+    to: web
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
+win:
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64

@@ -46,10 +46,17 @@ export interface WorkspaceState {
   allowed: WorkspaceOption[];
 }
 
-export type ThreadStatus = "idle" | "inProgress" | "completed" | "failed" | "interrupted";
+export type ThreadStatus =
+  | "notLoaded"
+  | "idle"
+  | "inProgress"
+  | "completed"
+  | "failed"
+  | "interrupted";
 
 export interface ThreadSummary {
   id: string;
+  name?: string | null;
   preview: string;
   cwd: string;
   createdAt: number;
@@ -292,6 +299,10 @@ export type FrontendEvent =
   | { type: "snapshot"; payload: SnapshotPayload }
   | { type: "account.updated"; payload: AccountSummary }
   | { type: "thread.started"; payload: { threadId: string } }
+  | { type: "thread.status"; payload: { threadId: string; status: ThreadStatus } }
+  | { type: "thread.archived"; payload: { threadId: string } }
+  | { type: "thread.unarchived"; payload: { threadId: string } }
+  | { type: "thread.named"; payload: { threadId: string; name: string | null } }
   | { type: "turn.started"; payload: { threadId: string; turnId: string } }
   | {
       type: "item.started" | "item.completed";

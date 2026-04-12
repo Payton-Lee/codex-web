@@ -13,4 +13,7 @@ apps/server/data/*.db-shm
 apps/server/data/*.db-wal
 apps/web/dist
 apps/server/dist
+apps/desktop/dist
+apps/desktop/bundle
+dist-desktop
 coverage

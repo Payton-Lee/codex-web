@@ -4,9 +4,31 @@ import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 
 const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
-const rootDir = path.resolve(currentFileDir, "../../..");
+const defaultRootDir = path.resolve(currentFileDir, "../../..");
 
-dotenv.config({ path: path.resolve(rootDir, ".env") });
+function resolveFrom(baseDir: string, targetPath: string): string {
+  return path.isAbsolute(targetPath) ? targetPath : path.resolve(baseDir, targetPath);
+}
+
+function firstExistingPath(candidates: string[]): string | undefined {
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+const envFilePath = firstExistingPath([
+  process.env.CODEX_WEB_ENV_PATH
+    ? resolveFrom(process.cwd(), process.env.CODEX_WEB_ENV_PATH)
+    : "",
+  path.resolve(process.cwd(), ".env"),
+  path.resolve(defaultRootDir, ".env")
+].filter(Boolean));
+
+if (envFilePath) {
+  dotenv.config({ path: envFilePath });
+}
+
+const rootDir = process.env.CODEX_PROJECT_ROOT
+  ? resolveFrom(process.cwd(), process.env.CODEX_PROJECT_ROOT)
+  : defaultRootDir;
 
 function parseNumber(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -70,6 +92,12 @@ function existingPath(candidates: string[]): string | null {
   return null;
 }
 
+function resolvePathSetting(value: string | undefined, fallbackRelativePath: string): string {
+  return value?.trim()
+    ? resolveFrom(rootDir, value.trim())
+    : path.resolve(rootDir, fallbackRelativePath);
+}
+
 function resolveCodexCommand(
   explicitCommand: string | undefined,
   cwd: string
@@ -101,7 +129,9 @@ function resolveCodexCommand(
   };
 }
 
-const configFilePath = path.resolve(rootDir, "codex-web.config.json");
+const configFilePath = process.env.CODEX_WEB_CONFIG_PATH?.trim()
+  ? resolveFrom(rootDir, process.env.CODEX_WEB_CONFIG_PATH.trim())
+  : path.resolve(rootDir, "codex-web.config.json");
 const fileConfig = fs.existsSync(configFilePath)
   ? (JSON.parse(fs.readFileSync(configFilePath, "utf8")) as {
       host?: string;
@@ -117,8 +147,9 @@ const host = process.env.HOST ?? fileConfig.host ?? "127.0.0.1";
 const serverPort = parseNumber(process.env.SERVER_PORT, fileConfig.serverPort ?? 9000);
 const webPort = parseNumber(process.env.WEB_PORT, fileConfig.webPort ?? 10000);
 const appServerPort = parseNumber(process.env.APP_SERVER_PORT, fileConfig.appServerPort ?? 4500);
-const auditLogDir = path.resolve(rootDir, process.env.AUDIT_LOG_DIR ?? "logs");
-const dataDir = path.resolve(rootDir, process.env.DATA_DIR ?? "data");
+const auditLogDir = resolvePathSetting(process.env.AUDIT_LOG_DIR, "logs");
+const dataDir = resolvePathSetting(process.env.DATA_DIR, "data");
+const webStaticDir = resolvePathSetting(process.env.CODEX_WEB_STATIC_DIR, "apps/web/dist");
 const resolvedCodexCommand = resolveCodexCommand(
   process.env.CODEX_APP_SERVER_COMMAND ?? fileConfig.codexCommand,
   rootDir
@@ -144,14 +175,14 @@ const codexConfigOverrideEntries = parseList(process.env.CODEX_CONFIG_OVERRIDES)
   .map((entry) => entry.trim())
   .filter(Boolean);
 const codexConfigOverrideSources = codexConfigOverrideEntries.map((entry) => {
-  const resolvedPath = path.resolve(rootDir, entry);
+  const resolvedPath = resolveFrom(rootDir, entry);
   if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
     return resolvedPath;
   }
   return entry;
 });
 const codexConfigOverrides = codexConfigOverrideEntries.flatMap((entry) => {
-  const resolvedPath = path.resolve(rootDir, entry);
+  const resolvedPath = resolveFrom(rootDir, entry);
   if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isFile()) {
     return expandTomlOverrideFile(resolvedPath);
   }
@@ -160,6 +191,8 @@ const codexConfigOverrides = codexConfigOverrideEntries.flatMap((entry) => {
 });
 
 export const appConfig = {
+  rootDir,
+  envFilePath,
   configFilePath,
   host,
   serverPort,
@@ -167,6 +200,7 @@ export const appConfig = {
   appServerPort,
   auditLogDir,
   dataDir,
+  webStaticDir,
   workspaceDbPath: path.resolve(dataDir, process.env.WORKSPACE_DB_FILE ?? "workspaces.db"),
   codexCommand: resolvedCodexCommand.command,
   codexCommandSource: resolvedCodexCommand.source,

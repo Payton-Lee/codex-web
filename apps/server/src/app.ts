@@ -17,6 +17,7 @@ import {
   SnapshotPayload,
   ThreadDetail,
   ThreadItem,
+  ThreadStatus,
   ThreadSummary
 } from "../../../packages/shared/src/index.js";
 import { appConfig } from "./config.js";
@@ -51,9 +52,27 @@ const ALL_THREAD_SOURCE_KINDS = [
   "unknown"
 ] as const;
 
-function toThreadSummary(thread: any, status: ThreadSummary["status"] = "idle"): ThreadSummary {
+function normalizeThreadStatus(
+  candidate: unknown,
+  fallback: ThreadStatus = "idle"
+): ThreadStatus {
+  switch (candidate) {
+    case "notLoaded":
+    case "idle":
+    case "inProgress":
+    case "completed":
+    case "failed":
+    case "interrupted":
+      return candidate;
+    default:
+      return fallback;
+  }
+}
+
+function toThreadSummary(thread: any, fallbackStatus: ThreadSummary["status"] = "idle"): ThreadSummary {
   return {
     id: thread.id,
+    name: typeof thread.name === "string" ? thread.name : null,
     preview: thread.preview,
     cwd: thread.cwd,
     createdAt: thread.createdAt,
@@ -61,7 +80,7 @@ function toThreadSummary(thread: any, status: ThreadSummary["status"] = "idle"):
     modelProvider: thread.modelProvider,
     cliVersion: thread.cliVersion,
     source: thread.source,
-    status
+    status: normalizeThreadStatus(thread.status, fallbackStatus)
   };
 }
 
@@ -332,35 +351,21 @@ export function createApp() {
   }
 
   async function refreshAccount(): Promise<AccountSummary> {
-    try {
-      const response = (await client.request<any>("account/read", { refreshToken: false })) ?? {};
-      const rateLimitsResponse = await client.request<any>("account/rateLimits/read", undefined).catch(
-        () => null
-      );
-      const nextAccount: AccountSummary = {
-        loggedIn: Boolean(response.account),
-        mode: response.account?.type ?? "unknown",
-        email: response.account?.email ?? null,
-        planType: response.account?.planType ?? null,
-        requiresOpenaiAuth: Boolean(response.requiresOpenaiAuth),
-        rateLimits: parseRateLimits(rateLimitsResponse?.rateLimits)
-      };
-      account = nextAccount;
-      broadcast({ type: "account.updated", payload: account });
-      return nextAccount;
-    } catch {
-      const fallback = await client.request<any>("getAuthStatus", {}).catch(() => null);
-      account = {
-        loggedIn: Boolean(fallback?.loggedIn ?? fallback?.authMode),
-        mode: fallback?.authMode === "chatgpt" ? "chatgpt" : "unknown",
-        email: fallback?.email ?? null,
-        planType: fallback?.planType ?? null,
-        requiresOpenaiAuth: false,
-        rateLimits: null
-      };
-      broadcast({ type: "account.updated", payload: account });
-      return account;
-    }
+    const response = (await client.request<any>("account/read", { refreshToken: false })) ?? {};
+    const rateLimitsResponse = await client.request<any>("account/rateLimits/read", undefined).catch(
+      () => null
+    );
+    const nextAccount: AccountSummary = {
+      loggedIn: Boolean(response.account),
+      mode: response.account?.type ?? "unknown",
+      email: response.account?.email ?? null,
+      planType: response.account?.planType ?? null,
+      requiresOpenaiAuth: Boolean(response.requiresOpenaiAuth),
+      rateLimits: parseRateLimits(rateLimitsResponse?.rateLimits)
+    };
+    account = nextAccount;
+    broadcast({ type: "account.updated", payload: account });
+    return nextAccount;
   }
 
   async function refreshThreads(): Promise<ThreadSummary[]> {
@@ -627,9 +632,62 @@ export function createApp() {
   client.on("notification", (message: JsonRpcNotification) => {
     const { method, params } = message;
     if (method === "thread/started") {
-      turnStatusByThread.set(params.thread.id, "idle");
-      threads.set(params.thread.id, toThreadSummary(params.thread, "idle"));
+      const status = normalizeThreadStatus(params.thread?.status, "idle");
+      turnStatusByThread.set(params.thread.id, status);
+      threads.set(params.thread.id, toThreadSummary(params.thread, status));
       broadcast({ type: "thread.started", payload: { threadId: params.thread.id } });
+      return;
+    }
+
+    if (method === "thread/status/changed") {
+      const status = normalizeThreadStatus(params.status, "idle");
+      turnStatusByThread.set(params.threadId, status);
+      const thread = threads.get(params.threadId);
+      if (thread) {
+        thread.status = status;
+      }
+      broadcast({
+        type: "thread.status",
+        payload: { threadId: params.threadId, status }
+      });
+      return;
+    }
+
+    if (method === "thread/archived") {
+      const threadId = String(params.threadId ?? params.thread?.id ?? "");
+      if (threadId) {
+        threads.delete(threadId);
+        turnStatusByThread.delete(threadId);
+        broadcast({ type: "thread.archived", payload: { threadId } });
+      }
+      return;
+    }
+
+    if (method === "thread/unarchived") {
+      const threadId = String(params.thread?.id ?? params.threadId ?? "");
+      if (params.thread?.id) {
+        threads.set(params.thread.id, toThreadSummary(params.thread, "idle"));
+      }
+      if (threadId) {
+        broadcast({ type: "thread.unarchived", payload: { threadId } });
+      }
+      return;
+    }
+
+    if (method === "thread/name/updated") {
+      const threadId = String(params.threadId ?? params.thread?.id ?? "");
+      const name = typeof params.name === "string"
+        ? params.name
+        : typeof params.thread?.name === "string"
+          ? params.thread.name
+          : null;
+      const thread = threadId ? threads.get(threadId) : undefined;
+      if (thread) {
+        thread.name = name;
+      }
+      if (threadId) {
+        broadcast({ type: "thread.named", payload: { threadId, name } });
+      }
       return;
     }
 
@@ -749,9 +807,7 @@ export function createApp() {
     if (
       method === "account/updated" ||
       method === "account/rateLimits/updated" ||
-      method === "account/login/completed" ||
-      method === "authStatusChange" ||
-      method === "loginChatGptComplete"
+      method === "account/login/completed"
     ) {
       logger.log("account.status.changed", { method });
       void refreshAccount().catch(() => undefined);
@@ -852,21 +908,30 @@ export function createApp() {
       return;
     }
     await ensureClientReady();
-    logger.log("account.login.requested", {});
-    try {
-      const login = await client.request<any>("account/login/start", { type: "chatgpt" });
-      if (login?.authUrl) {
-        openSystemBrowser(login.authUrl);
-      }
-      res.json(login);
-      return;
-    } catch {
-      const fallback = await client.request<any>("loginChatGpt", undefined);
-      if (fallback?.authUrl) {
-        openSystemBrowser(fallback.authUrl);
-      }
-      res.json(fallback);
+    const loginParams = {
+      type: "chatgpt",
+      ...(req.body ?? {})
+    };
+    logger.log("account.login.requested", { type: loginParams.type });
+    const login = await client.request<any>("account/login/start", loginParams);
+    if (login?.authUrl) {
+      openSystemBrowser(login.authUrl);
     }
+    res.json(login);
+  });
+
+  app.post("/api/account/login/cancel", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const loginId = String(req.body?.loginId ?? "").trim();
+    if (!loginId) {
+      res.status(400).json({ error: "loginId is required" });
+      return;
+    }
+    logger.log("account.login.cancel.requested", { loginId });
+    res.json(await client.request<any>("account/login/cancel", { loginId }));
   });
 
   app.post("/api/account/logout", async (req, res) => {
@@ -875,7 +940,7 @@ export function createApp() {
     }
     await ensureClientReady();
     logger.log("account.logout.requested", {});
-    await client.request("account/logout", undefined).catch(() => client.request("logoutChatGpt", undefined));
+    await client.request("account/logout", undefined);
     res.json(await refreshAccount());
   });
 
@@ -1021,10 +1086,26 @@ export function createApp() {
       cwd,
       approvalPolicy: appConfig.approvalPolicy,
       sandbox: appConfig.sandboxMode,
-      experimentalRawEvents: false
+      experimentalRawEvents: false,
+      ...(req.body ?? {})
     });
     const summary = toThreadSummary(response.thread, "idle");
     threads.set(summary.id, summary);
+    res.json(summary);
+  });
+
+  app.post("/api/threads/:threadId/fork", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const response = await client.request<any>("thread/fork", {
+      threadId: req.params.threadId,
+      ...(req.body ?? {})
+    });
+    const summary = toThreadSummary(response.thread, "idle");
+    threads.set(summary.id, summary);
+    await refreshThreads().catch(() => undefined);
     res.json(summary);
   });
 
@@ -1098,6 +1179,40 @@ export function createApp() {
     res.json({ turnId: response.turn.id });
   });
 
+  app.post("/api/threads/:threadId/steer", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+    const params = {
+      threadId: req.params.threadId,
+      ...(req.body ?? {})
+    } as Record<string, unknown>;
+    if (prompt && !params.input) {
+      params.input = [{ type: "text", text: prompt, text_elements: [] }];
+    }
+    if (!params.input) {
+      res.status(400).json({ error: "prompt or input is required" });
+      return;
+    }
+    logger.log("turn.steer.requested", { threadId: req.params.threadId });
+    res.json(await client.request<any>("turn/steer", params));
+  });
+
+  app.post("/api/threads/:threadId/review", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const params = {
+      threadId: req.params.threadId,
+      ...(req.body ?? {})
+    };
+    logger.log("review.start.requested", { threadId: req.params.threadId });
+    res.json(await client.request<any>("review/start", params));
+  });
+
   app.post("/api/threads/:threadId/interrupt", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
@@ -1108,6 +1223,81 @@ export function createApp() {
       turnId: req.body.turnId
     });
     res.json({ ok: true });
+  });
+
+  app.post("/api/threads/:threadId/archive", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    await client.request("thread/archive", { threadId: req.params.threadId });
+    await refreshThreads().catch(() => undefined);
+    res.json({ ok: true });
+  });
+
+  app.post("/api/threads/:threadId/unarchive", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const response = await client.request<any>("thread/unarchive", { threadId: req.params.threadId });
+    await refreshThreads().catch(() => undefined);
+    res.json(response?.thread ? toThreadSummary(response.thread, "idle") : response);
+  });
+
+  app.post("/api/threads/:threadId/name", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const name = typeof req.body?.name === "string" ? req.body.name : null;
+    await client.request("thread/name/set", {
+      threadId: req.params.threadId,
+      name
+    });
+    const thread = threads.get(req.params.threadId);
+    if (thread) {
+      thread.name = name;
+    }
+    res.json({ ok: true, threadId: req.params.threadId, name });
+  });
+
+  app.post("/api/threads/:threadId/mcp/resource/read", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const serverName = String(req.body?.server ?? "").trim();
+    const uri = String(req.body?.uri ?? "").trim();
+    if (!serverName || !uri) {
+      res.status(400).json({ error: "server and uri are required" });
+      return;
+    }
+    res.json(await client.request<any>("mcpServer/resource/read", {
+      threadId: req.params.threadId,
+      server: serverName,
+      uri
+    }));
+  });
+
+  app.post("/api/threads/:threadId/mcp/tool/call", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const serverName = String(req.body?.server ?? "").trim();
+    const tool = String(req.body?.tool ?? "").trim();
+    if (!serverName || !tool) {
+      res.status(400).json({ error: "server and tool are required" });
+      return;
+    }
+    res.json(await client.request<any>("mcpServer/tool/call", {
+      threadId: req.params.threadId,
+      server: serverName,
+      tool,
+      arguments: req.body?.arguments,
+      _meta: req.body?._meta
+    }));
   });
 
   app.get("/api/threads/:threadId/diffs/:turnId", async (req, res) => {
@@ -1179,7 +1369,7 @@ export function createApp() {
     res.json(settingsSummary());
   });
 
-  const staticDir = path.resolve(process.cwd(), "apps/web/dist");
+  const staticDir = appConfig.webStaticDir;
   if (fs.existsSync(staticDir)) {
     app.use(express.static(staticDir));
     app.get("*", (_req, res) => {

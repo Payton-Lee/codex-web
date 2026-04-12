@@ -1,0 +1,29 @@
+{
+  "name": "@codex-web/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Codex Web desktop shell powered by Electron",
+  "author": "Payton-Lee",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare:bundle": "node ./scripts/prepare-package.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "electron .",
+    "start:dev": "npm run build && electron .",
+    "pack": "npm run build && npm run prepare:bundle && electron-builder --config electron-builder.yml --dir",
+    "dist:win": "npm run build && npm run prepare:bundle && electron-builder --config electron-builder.yml --win nsis",
+    "dist:mac": "npm run build && npm run prepare:bundle && electron-builder --config electron-builder.yml --mac dmg"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "electron": "36.2.0",
+    "electron-builder": "26.0.12"
+  }
+}

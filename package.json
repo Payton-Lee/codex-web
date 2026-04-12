@@ -4,16 +4,23 @@
   "version": "0.1.0",
   "workspaces": [
     "apps/server",
-    "apps/web"
+    "apps/web",
+    "apps/desktop"
   ],
   "scripts": {
     "dev": "concurrently -n shared,server,web -c cyan,green,magenta \"npm run dev:shared\" \"npm run dev -w @codex-web/server\" \"npm run dev -w @codex-web/web\"",
+    "desktop:dev": "concurrently -n shared,server,web,desktop -c cyan,green,magenta,yellow \"npm run dev:shared\" \"npm run dev -w @codex-web/server\" \"npm run dev -w @codex-web/web\" \"npm run start:dev -w @codex-web/desktop\"",
     "dev:shared": "tsc -w -p tsconfig.shared.json",
     "build": "npm run build:shared && npm run build -w @codex-web/server && npm run build -w @codex-web/web",
+    "build:desktop": "npm run build -w @codex-web/desktop",
     "build:shared": "tsc -p tsconfig.shared.json",
+    "pack:desktop": "npm run build && npm run pack -w @codex-web/desktop",
+    "dist:win": "npm run build && npm run dist:win -w @codex-web/desktop",
+    "dist:mac": "npm run build && npm run dist:mac -w @codex-web/desktop",
     "start": "npm run start -w @codex-web/server",
+    "start:desktop": "npm run start -w @codex-web/desktop",
     "lint": "npm run lint -w @codex-web/server && npm run lint -w @codex-web/web",
-    "typecheck": "npm run build:shared && npm run typecheck -w @codex-web/server && npm run typecheck -w @codex-web/web"
+    "typecheck": "npm run build:shared && npm run typecheck -w @codex-web/server && npm run typecheck -w @codex-web/web && npm run typecheck -w @codex-web/desktop"
   },
   "devDependencies": {
     "@eslint/js": "^9.24.0",
