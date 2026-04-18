@@ -117,13 +117,13 @@ function TurnItem({ turn, isLatest }: { turn: ThreadTurn; isLatest: boolean }) {
         if (agentItem.text.length > 80) summaryText += "...";
      } else {
         const cmdItem = turn.items.find(i => i.type === "commandExecution" || i.type === "fileChange");
-        if (cmdItem) summaryText = `处理了相关代码变更指令 ${cmdItem.command || ""}`.substring(0,80);
+        if (cmdItem) summaryText = `处理了相关代码变更指令: ${cmdItem.command || ""}`.substring(0, 80);
      }
   }
 
   return (
     <div className="flex flex-col w-full mb-8 relative px-6">
-      {/* 永远渲染 UserMessage 置顶展示不可折叠 */}
+      {/* 姘歌繙娓叉煋 UserMessage 缃《灞曠ず涓嶅彲鎶樺彔 */}
       {turn.items.map((item) => {
         const userText = itemDisplayText(item);
         if (item.type === "userMessage" && userText) {
@@ -139,7 +139,7 @@ function TurnItem({ turn, isLatest }: { turn: ThreadTurn; isLatest: boolean }) {
         return null;
       })}
       
-      {/* 剩余的非用户指令，折叠展示或者完全展开逻辑 */}
+      {/* 鍓╀綑鐨勯潪鐢ㄦ埛鎸囦护锛屾姌鍙犲睍绀烘垨鑰呭畬鍏ㄥ睍寮€閫昏緫 */}
       {hasAIOrCommandItems && (
          expanded ? (
             <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="space-y-4 mt-2">
@@ -148,7 +148,7 @@ function TurnItem({ turn, isLatest }: { turn: ThreadTurn; isLatest: boolean }) {
 
                   return (
                     <div key={item.id} className="relative group w-full p-4 rounded-xl text-sm leading-relaxed bg-white/5 border border-border text-text-primary shadow-sm text-left">
-                       {/* 内部折叠悬浮按钮 */}
+                       {/* 鍐呴儴鎶樺彔鎮诞鎸夐挳 */}
                        {!isLatest && (
                           <button 
                             onClick={() => setExpanded(false)} 
@@ -297,14 +297,14 @@ export function ChatView({
       ? {
           label: "Chat",
           current: "当前线程",
-          description: "聊天流式输出、命令执行、文件修改均在此展示。",
+          description: "聊天流式输出、命令执行和文件修改都在这里展示。",
           emptyTitle: "今天我能帮你写点什么代码？",
           emptyText: canSend
-            ? "请选择的线程正在加载，或当前线程还没有消息。"
-            : "请先在左侧选择一个线程，或手动创建新线程后再发送消息。",
-          placeholder: "描述您想构建的内容，支持 /命令、@文件 和 $skill ...",
+            ? "所选线程正在加载，或者当前线程还没有消息。"
+            : "请先在左侧选择一个线程，或创建新线程后再发送消息。",
+          placeholder: "描述你想构建的内容，支持 /命令、@文件 和 $skill ...",
           hint: canSend
-            ? "Ctrl+回车发送，回车换行；/ 是本地命令，@ 文件、$ skill 为辅助输入"
+            ? "Ctrl+Enter 发送，Enter 换行。/ 是本地 UI 命令，@ 文件和 $ skill 为辅助输入。"
             : "当前未选中线程",
           send: "发送",
           stop: "停止当前任务"
@@ -509,6 +509,14 @@ export function ChatView({
     }
     if (command === "mcp") {
       setPrompt("/mcp ");
+      return true;
+    }
+    if (command === "rollback" || command === "shell") {
+      onSlashCommand?.(command);
+      setPrompt("");
+      setSuggestions([]);
+      setActiveToken(null);
+      setSelectedSuggestionIndex(0);
       return true;
     }
     if (
@@ -777,3 +785,4 @@ export function ChatView({
     </section>
   );
 }
+

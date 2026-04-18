@@ -14,7 +14,9 @@ export type SlashCommandId =
   | "runtime"
   | "skills"
   | "mcp"
-  | "compact";
+  | "compact"
+  | "rollback"
+  | "shell";
 
 export interface SlashCommandDefinition {
   id: SlashCommandId;

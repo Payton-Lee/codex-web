@@ -46,6 +46,21 @@ export interface WorkspaceState {
   allowed: WorkspaceOption[];
 }
 
+export interface SessionSummary {
+  sessionId: string;
+  queryKey: string;
+  accountId: string;
+  accountEmail: string;
+  workspaceId: string;
+  workspacePath: string;
+  workspaceDisplayName: string;
+  threadId: string | null;
+  createdAt: number;
+  updatedAt: number;
+  lastOpenedAt: number;
+  archived: boolean;
+}
+
 export type ThreadStatus =
   | "notLoaded"
   | "idle"

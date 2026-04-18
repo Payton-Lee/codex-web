@@ -31,6 +31,10 @@ export default defineConfig({
         target: `http://${host}:${serverPort}`,
         changeOrigin: false
       },
+      "/help": {
+        target: `http://${host}:${serverPort}`,
+        changeOrigin: false
+      },
       "/ws": {
         target: `ws://${host}:${serverPort}`,
         ws: true

@@ -1,15 +1,61 @@
 import { spawn } from "node:child_process";
 
-export function openSystemBrowser(url: string): void {
+export interface BrowserOpenResult {
+  ok: boolean;
+  message: string;
+}
+
+function buildOpenCommand(url: string): { command: string; args: string[] } {
   const platform = process.platform;
+
   if (platform === "win32") {
-    spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore" }).unref();
-    return;
+    // `start` is a cmd builtin. Wrap the URL so `&` inside OAuth query strings
+    // is treated as part of the argument instead of a command separator.
+    return {
+      command: "cmd",
+      args: ["/d", "/s", "/c", "start", "", `"${url.replace(/"/g, '""')}"`]
+    };
   }
+
   if (platform === "darwin") {
-    spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
-    return;
+    return {
+      command: "open",
+      args: [url]
+    };
   }
-  spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
+
+  return {
+    command: "xdg-open",
+    args: [url]
+  };
+}
+
+export function openSystemBrowser(url: string): Promise<BrowserOpenResult> {
+  return new Promise((resolve) => {
+    const { command, args } = buildOpenCommand(url);
+
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    let settled = false;
+
+    child.once("error", (error) => {
+      settled = true;
+      resolve({
+        ok: false,
+        message: error.message
+      });
+    });
+
+    child.once("spawn", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.unref();
+      resolve({
+        ok: true,
+        message: `opened via ${command}`
+      });
+    });
+  });
 }
 

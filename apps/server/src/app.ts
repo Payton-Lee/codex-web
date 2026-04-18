@@ -25,8 +25,10 @@ import { AuditLogger } from "./logger.js";
 import { WorkspaceGuard } from "./workspace-guard.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
 import { openSystemBrowser } from "./open-browser.js";
+import { openFolderDialog } from "./open-folder-dialog.js";
 import { buildDiffPreview } from "./diff-preview.js";
 import { searchSkills, searchWorkspaceFiles } from "./composer.js";
+import { SessionStore } from "./session-store.js";
 
 type JsonRpcServerRequest = {
   id: string | number;
@@ -145,6 +147,67 @@ function isThreadNotFoundError(error: unknown): boolean {
   return message.includes("thread not found");
 }
 
+function isAppServerUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Codex app-server") && message.includes("尚未启动");
+}
+
+function isLoginServerPortBlockedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("failed to start login server") &&
+    (message.includes("10013") || message.includes("访问权限不允许"))
+  );
+}
+
+function loginServerPortBlockedMessage(): string {
+  return "无法启动 ChatGPT 登录回调服务。Windows 当前阻止了 localhost:1455（常见于系统保留端口/Hyper-V/WSL/Docker/VPN 占用）。请避免退出当前登录态，或改用 API key 登录。";
+}
+
+function loginHelpDocPath(): string {
+  return path.join(appConfig.rootDir, "docs", "Windows 登录失败 10013 处理提示.md");
+}
+
+function normalizeLoginStartResponse(login: any): {
+  authUrl: string | null;
+  loginId: string | null;
+  browserOpen: { ok: boolean; message: string } | null;
+  raw: any;
+} {
+  const authUrlCandidates = [
+    login?.authUrl,
+    login?.auth_url,
+    login?.url,
+    login?.loginUrl,
+    login?.login_url,
+    login?.data?.authUrl,
+    login?.data?.auth_url,
+    login?.data?.url,
+    login?.data?.loginUrl,
+    login?.data?.login_url
+  ];
+  const loginIdCandidates = [
+    login?.loginId,
+    login?.login_id,
+    login?.id,
+    login?.data?.loginId,
+    login?.data?.login_id,
+    login?.data?.id
+  ];
+
+  const authUrl =
+    authUrlCandidates.find((entry) => typeof entry === "string" && entry.trim().length > 0)?.trim() ?? null;
+  const loginId =
+    loginIdCandidates.find((entry) => typeof entry === "string" && entry.trim().length > 0)?.trim() ?? null;
+
+  return {
+    authUrl,
+    loginId,
+    browserOpen: null,
+    raw: login ?? null
+  };
+}
+
 function parseRateLimits(rateLimits: any) {
   if (!rateLimits) {
     return null;
@@ -254,6 +317,7 @@ export function createApp() {
     appConfig.defaultWorkspace,
     appConfig.workspaceDbPath
   );
+  const sessionStore = new SessionStore(appConfig.workspaceDbPath);
   const env = {
     ...process.env
   };
@@ -364,6 +428,7 @@ export function createApp() {
       rateLimits: parseRateLimits(rateLimitsResponse?.rateLimits)
     };
     account = nextAccount;
+    sessionStore.upsertAccount(nextAccount);
     broadcast({ type: "account.updated", payload: account });
     return nextAccount;
   }
@@ -407,7 +472,53 @@ export function createApp() {
       loadedThreadIds: [...(loaded?.data ?? [])],
       refreshedAt: Date.now()
     };
-    return Array.from(latestThreads.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+    const orderedThreads = Array.from(latestThreads.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+    sessionStore.syncThreads(orderedThreads);
+    return orderedThreads;
+  }
+
+  async function readSessionOrRespond(
+    req: Request,
+    res: Response
+  ): Promise<import("../../../packages/shared/src/index.js").SessionSummary | null> {
+    await ensureClientReady();
+    const currentAccount = await refreshAccount();
+    const sessionId = String(req.params.sessionId ?? req.body?.sessionId ?? "").trim();
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId is required" });
+      return null;
+    }
+    const session = sessionStore.getSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: `session not found: ${sessionId}` });
+      return null;
+    }
+    if (!currentAccount.loggedIn || !currentAccount.email) {
+      res.status(401).json({ error: "current account is not signed in" });
+      return null;
+    }
+    if (currentAccount.email.trim().toLowerCase() !== session.accountEmail.trim().toLowerCase()) {
+      res.status(403).json({ error: "session does not belong to current account" });
+      return null;
+    }
+    return session;
+  }
+
+  async function resolveSessionForCurrentContext(
+    workspacePath: string,
+    threadId?: string | null
+  ): Promise<import("../../../packages/shared/src/index.js").SessionSummary | null> {
+    const currentAccount = await refreshAccount();
+    if (!currentAccount.loggedIn || !currentAccount.email) {
+      return null;
+    }
+    const knownThread = threadId ? threads.get(threadId) ?? null : null;
+    return sessionStore.resolveSession({
+      account: currentAccount,
+      workspacePath,
+      threadId: threadId ?? null,
+      threadSummary: knownThread
+    });
   }
 
   async function refreshAppServerCatalog(): Promise<AppServerCatalog> {
@@ -839,6 +950,16 @@ export function createApp() {
       return;
     }
 
+    if (
+      message.method !== "item/commandExecution/requestApproval" &&
+      message.method !== "item/fileChange/requestApproval" &&
+      message.method !== "tool/requestUserInput"
+    ) {
+      logger.log("server.request.unsupported", { method: message.method });
+      client.respondError(message.id, `Unsupported server request: ${message.method}`);
+      return;
+    }
+
     const requestId = message.id;
     const params = message.params ?? {};
     const approval: ApprovalRequest = {
@@ -884,40 +1005,102 @@ export function createApp() {
     });
   });
 
+  app.get("/help/windows-login-10013", (_req, res) => {
+    const helpPath = loginHelpDocPath();
+    if (!fs.existsSync(helpPath)) {
+      res.status(404).type("text/plain; charset=utf-8").send("未找到登录失败处理说明文档。");
+      return;
+    }
+    res.type("text/markdown; charset=utf-8");
+    res.sendFile(helpPath);
+  });
+
   app.get("/api/bootstrap", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
     }
-    await ensureClientReady();
-    await refreshAccount();
-    await refreshThreads();
-    await refreshAppServerCatalog().catch(() => appServerCatalog);
-    res.json(snapshot());
+    try {
+      await ensureClientReady();
+      await refreshAccount();
+      await refreshThreads();
+      await refreshAppServerCatalog().catch(() => appServerCatalog);
+      res.json(snapshot());
+    } catch (error) {
+      if (isLoginServerPortBlockedError(error)) {
+        res.status(503).json({
+          error: loginServerPortBlockedMessage(),
+          code: "LOGIN_SERVER_PORT_BLOCKED",
+          appServer: client.getStatus()
+        });
+        return;
+      }
+      if (isAppServerUnavailableError(error)) {
+        res.status(503).json({
+          error: "Codex app-server 尚未就绪",
+          appServer: client.getStatus()
+        });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.get("/api/account", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
     }
-    await ensureClientReady();
-    res.json(await refreshAccount());
+    try {
+      await ensureClientReady();
+      res.json(await refreshAccount());
+    } catch (error) {
+      if (isAppServerUnavailableError(error)) {
+        res.status(503).json({
+          error: "Codex app-server 尚未就绪",
+          appServer: client.getStatus()
+        });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.post("/api/account/login", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
     }
-    await ensureClientReady();
-    const loginParams = {
-      type: "chatgpt",
-      ...(req.body ?? {})
-    };
-    logger.log("account.login.requested", { type: loginParams.type });
-    const login = await client.request<any>("account/login/start", loginParams);
-    if (login?.authUrl) {
-      openSystemBrowser(login.authUrl);
+    try {
+      await ensureClientReady();
+      const loginParams = {
+        type: "chatgpt",
+        ...(req.body ?? {})
+      };
+      logger.log("account.login.requested", { type: loginParams.type });
+      const login = await client.request<any>("account/login/start", loginParams);
+      const normalized = normalizeLoginStartResponse(login);
+      if (normalized.authUrl) {
+        normalized.browserOpen = await openSystemBrowser(normalized.authUrl);
+      }
+      logger.log("account.login.started", {
+        loginId: normalized.loginId,
+        hasAuthUrl: Boolean(normalized.authUrl),
+        browserOpenOk: normalized.browserOpen?.ok ?? false,
+        browserOpenMessage: normalized.browserOpen?.message ?? null,
+        responseKeys:
+          normalized.raw && typeof normalized.raw === "object"
+            ? Object.keys(normalized.raw).slice(0, 20)
+            : []
+      });
+      res.json(normalized);
+    } catch (error) {
+      if (isAppServerUnavailableError(error)) {
+        res.status(503).json({
+          error: "Codex app-server 尚未就绪",
+          appServer: client.getStatus()
+        });
+        return;
+      }
+      throw error;
     }
-    res.json(login);
   });
 
   app.post("/api/account/login/cancel", async (req, res) => {
@@ -944,6 +1127,39 @@ export function createApp() {
     res.json(await refreshAccount());
   });
 
+  app.get("/api/sessions/:sessionId", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    const session = await readSessionOrRespond(req, res);
+    if (!session) {
+      return;
+    }
+    res.json(session);
+  });
+
+  app.post("/api/sessions/resolve", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const workspacePath = String(req.body?.workspacePath ?? workspaceGuard.getCurrentWorkspace() ?? "").trim();
+    const threadId =
+      typeof req.body?.threadId === "string" && req.body.threadId.trim().length > 0
+        ? req.body.threadId.trim()
+        : null;
+    if (!workspacePath) {
+      res.status(400).json({ error: "workspacePath is required" });
+      return;
+    }
+    const session = await resolveSessionForCurrentContext(workspacePath, threadId);
+    if (!session) {
+      res.status(400).json({ error: "current account does not support session resolution" });
+      return;
+    }
+    res.json(session);
+  });
+
   app.get("/api/workspaces", (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
@@ -951,12 +1167,37 @@ export function createApp() {
     res.json(workspaceGuard.list());
   });
 
+  app.post("/api/workspaces/pick", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    try {
+      const picked = await openFolderDialog();
+      if (picked.canceled || !picked.path) {
+        res.json({
+          canceled: true,
+          workspace: workspaceGuard.list()
+        });
+        return;
+      }
+      const added = workspaceGuard.addWorkspace(picked.path, "folder_picker");
+      logger.log("workspace.picked", { path: added });
+      res.json({
+        canceled: false,
+        path: added,
+        workspace: workspaceGuard.list()
+      });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post("/api/workspaces", (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
     }
     try {
-      const added = workspaceGuard.addWorkspace(String(req.body.path ?? ""));
+      const added = workspaceGuard.addWorkspace(String(req.body.path ?? ""), "manual_input");
       logger.log("workspace.added", { path: added });
       res.json(workspaceGuard.list());
     } catch (error) {
@@ -969,7 +1210,7 @@ export function createApp() {
       return;
     }
     try {
-      const selected = workspaceGuard.setCurrentWorkspace(String(req.body.path ?? ""));
+      const selected = workspaceGuard.setCurrentWorkspace(String(req.body.path ?? ""), "manual_select");
       logger.log("workspace.selected", { path: selected });
       res.json(workspaceGuard.list());
     } catch (error) {
@@ -1071,6 +1312,466 @@ export function createApp() {
     }
   });
 
+  app.get("/api/app-server/apps", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    try {
+      res.json(await client.request<any>("app/list", req.query ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/plugin/read", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const marketplacePath = String(req.body?.marketplacePath ?? "").trim();
+    const pluginName = String(req.body?.pluginName ?? "").trim();
+    if (!marketplacePath || !pluginName) {
+      res.status(400).json({ error: "marketplacePath and pluginName are required" });
+      return;
+    }
+    logger.log("plugin.read.requested", { marketplacePath, pluginName });
+    try {
+      res.json(await client.request<any>("plugin/read", {
+        marketplacePath,
+        pluginName
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/marketplaces", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("marketplace.add.requested", {
+      marketplacePath: req.body?.marketplacePath ?? null
+    });
+    try {
+      res.json(await client.request<any>("marketplace/add", req.body ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/plugin/install", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("plugin.install.requested", {
+      marketplacePath: req.body?.marketplacePath ?? null,
+      pluginName: req.body?.pluginName ?? null
+    });
+    try {
+      res.json(await client.request<any>("plugin/install", req.body ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/plugin/uninstall", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("plugin.uninstall.requested", {
+      marketplacePath: req.body?.marketplacePath ?? null,
+      pluginName: req.body?.pluginName ?? null
+    });
+    try {
+      res.json(await client.request<any>("plugin/uninstall", req.body ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/skills/config", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("skills.config.write.requested", {
+      skillName: req.body?.skillName ?? null
+    });
+    try {
+      res.json(await client.request<any>("skills/config/write", req.body ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/mcp/reload", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("config.mcp_server.reload.requested", {});
+    try {
+      res.json(await client.request<any>("config/mcpServer/reload", {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/app-server/config", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    try {
+      res.json(await client.request<any>("config/read", req.query ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/app-server/config-requirements", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    try {
+      res.json(await client.request<any>("configRequirements/read", req.query ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/config/value", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const key = String(req.body?.key ?? "").trim();
+    if (!key) {
+      res.status(400).json({ error: "key is required" });
+      return;
+    }
+    logger.log("config.value.write.requested", { key });
+    try {
+      res.json(await client.request<any>("config/value/write", {
+        key,
+        value: req.body?.value
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/config/batch", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const entries = Array.isArray(req.body?.entries) ? req.body.entries : null;
+    if (!entries) {
+      res.status(400).json({ error: "entries are required" });
+      return;
+    }
+    logger.log("config.batch_write.requested", { entryCount: entries.length });
+    try {
+      res.json(await client.request<any>("config/batchWrite", {
+        entries
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/app-server/experimental-features/:name/enablement", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const enabled = Boolean(req.body?.enabled);
+    logger.log("experimental_feature.enablement.set.requested", {
+      name: req.params.name,
+      enabled
+    });
+    try {
+      res.json(await client.request<any>("experimentalFeature/enablement/set", {
+        name: req.params.name,
+        enabled
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/commands/exec", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("command.exec.requested", {
+      cwd: typeof req.body?.cwd === "string" ? req.body.cwd : null,
+      command: typeof req.body?.command === "string" ? req.body.command : null
+    });
+    try {
+      res.json(await client.request<any>("command/exec", req.body ?? {}));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/commands/exec/:processId/write", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const processId = Number(req.params.processId);
+    if (!Number.isFinite(processId)) {
+      res.status(400).json({ error: "processId must be a number" });
+      return;
+    }
+    logger.log("command.exec.write.requested", { processId });
+    try {
+      res.json(await client.request<any>("command/exec/write", {
+        processId,
+        ...(req.body ?? {})
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/commands/exec/:processId/resize", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const processId = Number(req.params.processId);
+    if (!Number.isFinite(processId)) {
+      res.status(400).json({ error: "processId must be a number" });
+      return;
+    }
+    logger.log("command.exec.resize.requested", { processId });
+    try {
+      res.json(await client.request<any>("command/exec/resize", {
+        processId,
+        ...(req.body ?? {})
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/commands/exec/:processId/terminate", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const processId = Number(req.params.processId);
+    if (!Number.isFinite(processId)) {
+      res.status(400).json({ error: "processId must be a number" });
+      return;
+    }
+    logger.log("command.exec.terminate.requested", { processId });
+    try {
+      res.json(await client.request<any>("command/exec/terminate", { processId }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/read-file", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    if (!pathValue) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    logger.log("fs.read_file.requested", { path: pathValue });
+    try {
+      res.json(await client.request<any>("fs/readFile", {
+        path: pathValue
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/write-file", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    const dataBase64 = String(req.body?.dataBase64 ?? "").trim();
+    if (!pathValue || !dataBase64) {
+      res.status(400).json({ error: "path and dataBase64 are required" });
+      return;
+    }
+    logger.log("fs.write_file.requested", { path: pathValue });
+    try {
+      res.json(await client.request<any>("fs/writeFile", {
+        path: pathValue,
+        dataBase64
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/create-directory", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    if (!pathValue) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    logger.log("fs.create_directory.requested", { path: pathValue });
+    try {
+      res.json(await client.request<any>("fs/createDirectory", {
+        path: pathValue,
+        recursive: req.body?.recursive
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/metadata", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    if (!pathValue) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    logger.log("fs.metadata.requested", { path: pathValue });
+    try {
+      res.json(await client.request<any>("fs/getMetadata", {
+        path: pathValue
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/read-directory", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    if (!pathValue) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    logger.log("fs.read_directory.requested", { path: pathValue });
+    try {
+      res.json(await client.request<any>("fs/readDirectory", {
+        path: pathValue
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/remove", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    if (!pathValue) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    logger.log("fs.remove.requested", { path: pathValue });
+    try {
+      res.json(await client.request<any>("fs/remove", {
+        path: pathValue,
+        recursive: req.body?.recursive,
+        force: req.body?.force
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/copy", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const source = String(req.body?.source ?? "").trim();
+    const destination = String(req.body?.destination ?? "").trim();
+    if (!source || !destination) {
+      res.status(400).json({ error: "source and destination are required" });
+      return;
+    }
+    logger.log("fs.copy.requested", { source, destination });
+    try {
+      res.json(await client.request<any>("fs/copy", {
+        source,
+        destination,
+        recursive: req.body?.recursive
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/watch", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const pathValue = String(req.body?.path ?? "").trim();
+    const watchId = String(req.body?.watchId ?? "").trim();
+    if (!pathValue || !watchId) {
+      res.status(400).json({ error: "path and watchId are required" });
+      return;
+    }
+    logger.log("fs.watch.requested", { path: pathValue, watchId });
+    try {
+      res.json(await client.request<any>("fs/watch", {
+        path: pathValue,
+        watchId
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/fs/unwatch", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const watchId = String(req.body?.watchId ?? "").trim();
+    if (!watchId) {
+      res.status(400).json({ error: "watchId is required" });
+      return;
+    }
+    logger.log("fs.unwatch.requested", { watchId });
+    try {
+      res.json(await client.request<any>("fs/unwatch", {
+        watchId
+      }));
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post("/api/threads", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
@@ -1091,6 +1792,7 @@ export function createApp() {
     });
     const summary = toThreadSummary(response.thread, "idle");
     threads.set(summary.id, summary);
+    sessionStore.upsertThread(summary);
     res.json(summary);
   });
 
@@ -1105,6 +1807,7 @@ export function createApp() {
     });
     const summary = toThreadSummary(response.thread, "idle");
     threads.set(summary.id, summary);
+    sessionStore.upsertThread(summary);
     await refreshThreads().catch(() => undefined);
     res.json(summary);
   });
@@ -1262,6 +1965,162 @@ export function createApp() {
     res.json({ ok: true, threadId: req.params.threadId, name });
   });
 
+  app.post("/api/threads/:threadId/metadata", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("thread.metadata.update.requested", {
+      threadId: req.params.threadId
+    });
+    const response = await client.request<any>("thread/metadata/update", {
+      threadId: req.params.threadId,
+      ...(req.body ?? {})
+    });
+    if (response?.thread) {
+      const status = normalizeThreadStatus(response.thread.status, "idle");
+      const summary = toThreadSummary(response.thread, status);
+      threads.set(summary.id, summary);
+      turnStatusByThread.set(summary.id, status);
+      sessionStore.upsertThread(summary);
+      res.json(toThreadDetail(response.thread, status));
+      return;
+    }
+    res.json(response);
+  });
+
+  app.post("/api/threads/:threadId/compact", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("thread.compact.requested", { threadId: req.params.threadId });
+    await client.request("thread/compact/start", {
+      threadId: req.params.threadId,
+      ...(req.body ?? {})
+    });
+    res.json({ ok: true });
+  });
+
+  app.post("/api/threads/:threadId/rollback", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const requestedTurnCount = Number(req.body?.turnCount ?? req.body?.count ?? 1);
+    const turnCount = Number.isFinite(requestedTurnCount) && requestedTurnCount > 0
+      ? Math.floor(requestedTurnCount)
+      : 1;
+    logger.log("thread.rollback.requested", {
+      threadId: req.params.threadId,
+      turnCount
+    });
+    const response = await client.request<any>("thread/rollback", {
+      threadId: req.params.threadId,
+      turnCount
+    });
+    if (response?.thread) {
+      const status = normalizeThreadStatus(response.thread.status, "idle");
+      const summary = toThreadSummary(response.thread, status);
+      threads.set(summary.id, summary);
+      turnStatusByThread.set(summary.id, status);
+      sessionStore.upsertThread(summary);
+      res.json(toThreadDetail(response.thread, status));
+      return;
+    }
+    await refreshThreads().catch(() => undefined);
+    res.json(response);
+  });
+
+  app.post("/api/threads/:threadId/background-terminals/clean", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("thread.background_terminals.clean.requested", {
+      threadId: req.params.threadId
+    });
+    await client.request("thread/backgroundTerminals/clean", {
+      threadId: req.params.threadId
+    });
+    res.json({ ok: true });
+  });
+
+  app.post("/api/threads/:threadId/shell-command", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("thread.shell_command.requested", {
+      threadId: req.params.threadId
+    });
+    res.json(await client.request<any>("thread/shellCommand", {
+      threadId: req.params.threadId,
+      ...(req.body ?? {})
+    }));
+  });
+
+  app.post("/api/threads/:threadId/items/inject", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const items = Array.isArray(req.body?.items) ? req.body.items : null;
+    if (!items) {
+      res.status(400).json({ error: "items are required" });
+      return;
+    }
+    logger.log("thread.inject_items.requested", {
+      threadId: req.params.threadId,
+      itemCount: items.length
+    });
+    res.json(await client.request<any>("thread/inject_items", {
+      threadId: req.params.threadId,
+      items
+    }));
+  });
+
+  app.post("/api/threads/:threadId/memory-mode", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    const mode = String(req.body?.mode ?? "").trim();
+    if (mode !== "enabled" && mode !== "disabled") {
+      res.status(400).json({ error: "mode must be enabled or disabled" });
+      return;
+    }
+    logger.log("thread.memory_mode.set.requested", {
+      threadId: req.params.threadId,
+      mode
+    });
+    res.json(await client.request<any>("thread/memoryMode/set", {
+      threadId: req.params.threadId,
+      mode
+    }));
+  });
+
+  app.post("/api/memory/reset", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("memory.reset.requested", {});
+    res.json(await client.request<any>("memory/reset", req.body ?? {}));
+  });
+
+  app.post("/api/threads/:threadId/unsubscribe", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    await ensureClientReady();
+    logger.log("thread.unsubscribe.requested", { threadId: req.params.threadId });
+    await client.request("thread/unsubscribe", {
+      threadId: req.params.threadId
+    });
+    res.json({ ok: true });
+  });
+
   app.post("/api/threads/:threadId/mcp/resource/read", async (req, res) => {
     if (!requireOrigin(req, res)) {
       return;
@@ -1372,7 +2231,8 @@ export function createApp() {
   const staticDir = appConfig.webStaticDir;
   if (fs.existsSync(staticDir)) {
     app.use(express.static(staticDir));
-    app.get("*", (_req, res) => {
+    // Express 5 requires a named wildcard parameter for SPA fallbacks.
+    app.get("/{*splat}", (_req, res) => {
       res.sendFile(path.join(staticDir, "index.html"));
     });
   }

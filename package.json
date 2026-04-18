@@ -8,8 +8,9 @@
     "apps/desktop"
   ],
   "scripts": {
-    "dev": "concurrently -n shared,server,web -c cyan,green,magenta \"npm run dev:shared\" \"npm run dev -w @codex-web/server\" \"npm run dev -w @codex-web/web\"",
-    "desktop:dev": "concurrently -n shared,server,web,desktop -c cyan,green,magenta,yellow \"npm run dev:shared\" \"npm run dev -w @codex-web/server\" \"npm run dev -w @codex-web/web\" \"npm run start:dev -w @codex-web/desktop\"",
+    "dev": "npm run build:shared && npm run build -w @codex-web/server && concurrently -c auto -n server,web \"npm run start -w @codex-web/server\" \"npm run dev -w @codex-web/web\"",
+    "dev:watch": "node ./scripts/dev-runner.mjs",
+    "desktop:dev": "node ./scripts/dev-runner.mjs --desktop",
     "dev:shared": "tsc -w -p tsconfig.shared.json",
     "build": "npm run build:shared && npm run build -w @codex-web/server && npm run build -w @codex-web/web",
     "build:desktop": "npm run build -w @codex-web/desktop",

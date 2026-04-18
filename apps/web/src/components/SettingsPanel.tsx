@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Activity, FlaskConical, Package, Settings2, Shield, TerminalSquare, Wrench } from "lucide-react";
 import type { AppServerCatalog, SettingsSummary } from "../shared";
 import { cn } from "../lib/utils";
@@ -11,6 +11,18 @@ interface Props {
   activeSection: SettingsSection;
   onSectionChange(section: SettingsSection): void;
   onRefreshCatalog(): void;
+  onRefreshApps(): void;
+  onReloadMcp(): void;
+  onReadPlugin(): void;
+  onExecCommand(command: string, cwd?: string | null): void;
+  onReadFsFile(path: string): void;
+  onReadFsDirectory(path: string): void;
+  onReadFsMetadata(path: string): void;
+  appServerAppsRaw: string | null;
+  pluginReadRaw: string | null;
+  mcpReloadRaw: string | null;
+  commandExecRaw: string | null;
+  fsDebugRaw: string | null;
 }
 
 const SECTIONS: Array<{ id: SettingsSection; label: string; icon: typeof Settings2 }> = [
@@ -32,7 +44,28 @@ function SectionCard({ title, subtitle, children }: { title: string; subtitle: s
   );
 }
 
-export function SettingsPanel({ settings, catalog, activeSection, onSectionChange, onRefreshCatalog }: Props) {
+export function SettingsPanel({
+  settings,
+  catalog,
+  activeSection,
+  onSectionChange,
+  onRefreshCatalog,
+  onRefreshApps,
+  onReloadMcp,
+  onReadPlugin,
+  onExecCommand,
+  onReadFsFile,
+  onReadFsDirectory,
+  onReadFsMetadata,
+  appServerAppsRaw,
+  pluginReadRaw,
+  mcpReloadRaw,
+  commandExecRaw,
+  fsDebugRaw
+}: Props) {
+  const [commandInput, setCommandInput] = useState("");
+  const [commandCwd, setCommandCwd] = useState("");
+  const [fsPath, setFsPath] = useState("");
   const refreshedAtLabel = catalog.refreshedAt ? new Date(catalog.refreshedAt).toLocaleString() : "尚未刷新";
   const codexArgs = settings.codexArgs ?? [];
   const effectiveCodexHomeDir = settings.effectiveCodexHomeDir ?? settings.codexHomeDir ?? "~/.codex";
@@ -65,7 +98,7 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
           onClick={onRefreshCatalog}
           className="rounded-md bg-white/5 px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
         >
-          刷新能力清单
+          刷新能力目录
         </button>
       </div>
 
@@ -74,15 +107,21 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
           <div className="grid gap-3">
             <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
               <Activity size={16} className="text-[var(--accent)]" />
-              <div>后端监听: {settings.host}:{settings.serverPort}</div>
+              <div>
+                后端监听: {settings.host}:{settings.serverPort}
+              </div>
             </div>
             <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
               <TerminalSquare size={16} className="text-[var(--accent)]" />
-              <div>前端 {settings.webPort} · app-server {settings.appServerPort}</div>
+              <div>
+                前端 {settings.webPort} / app-server {settings.appServerPort}
+              </div>
             </div>
             <div className="shell-card flex items-center gap-3 p-3 text-sm text-[var(--text-secondary)]">
               <Shield size={16} className="text-[var(--accent)]" />
-              <div>{settings.approvalPolicy} · {settings.sandboxMode}</div>
+              <div>
+                {settings.approvalPolicy} / {settings.sandboxMode}
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3 text-xs text-[var(--text-secondary)]">
               <div className="shell-card p-3">skills: {catalog.skills.length}</div>
@@ -90,25 +129,27 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
               <div className="shell-card p-3">models: {catalog.models.length}</div>
               <div className="shell-card p-3">modes: {catalog.collaborationModes.length}</div>
             </div>
-            <div className="font-mono text-xs text-[var(--text-secondary)] break-all">
+            <div className="break-all font-mono text-xs text-[var(--text-secondary)]">
               codex: {settings.codexCommand} {codexArgs.join(" ")}
             </div>
             <div className="text-xs text-[var(--text-secondary)]">
-              来源: {settings.codexCommandSource === "local" ? "项目本地依赖" : settings.codexCommandSource === "explicit" ? "显式配置" : "全局 PATH"}
+              来源:
+              {" "}
+              {settings.codexCommandSource === "local"
+                ? "项目本地依赖"
+                : settings.codexCommandSource === "explicit"
+                  ? "显式配置"
+                  : "全局 PATH"}
             </div>
-            <div className="text-xs text-[var(--text-secondary)] break-all">
-              状态目录: {effectiveCodexHomeDir}
-            </div>
-            <div className="text-xs text-[var(--text-secondary)] break-all">
+            <div className="break-all text-xs text-[var(--text-secondary)]">状态目录: {effectiveCodexHomeDir}</div>
+            <div className="break-all text-xs text-[var(--text-secondary)]">
               显式 CODEX_HOME: {settings.codexHomeDir ?? "未设置，使用默认 ~/.codex"}
             </div>
-            <div className="text-xs text-[var(--text-secondary)]">
-              MCP/配置覆盖来源:
-            </div>
+            <div className="text-xs text-[var(--text-secondary)]">MCP / 配置覆盖来源:</div>
             <div className="space-y-1 text-[10px] text-[var(--text-secondary)]">
               {codexConfigOverrideSources.length ? (
                 codexConfigOverrideSources.map((source) => (
-                  <div key={source} className="font-mono break-all">
+                  <div key={source} className="break-all font-mono">
                     {source}
                   </div>
                 ))
@@ -116,8 +157,101 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
                 <div>无额外覆盖配置</div>
               )}
             </div>
-            <div className="text-[10px] text-[var(--text-secondary)]">
-              catalog refreshed: {refreshedAtLabel}
+            <div className="text-[10px] text-[var(--text-secondary)]">catalog refreshed: {refreshedAtLabel}</div>
+            <div className="grid gap-2 md:grid-cols-3">
+              <button
+                onClick={onRefreshApps}
+                className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+              >
+                Read app/list
+              </button>
+              <button
+                onClick={onReloadMcp}
+                className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+              >
+                Reload MCP config
+              </button>
+              <button
+                onClick={onReadPlugin}
+                className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+              >
+                Read first plugin
+              </button>
+            </div>
+            {appServerAppsRaw ? (
+              <pre className="max-h-56 overflow-auto rounded-md bg-black/30 p-3 text-[10px] text-[var(--text-secondary)]">
+                {appServerAppsRaw}
+              </pre>
+            ) : null}
+            {mcpReloadRaw ? (
+              <pre className="max-h-40 overflow-auto rounded-md bg-black/30 p-3 text-[10px] text-[var(--text-secondary)]">
+                {mcpReloadRaw}
+              </pre>
+            ) : null}
+            {pluginReadRaw ? (
+              <pre className="max-h-56 overflow-auto rounded-md bg-black/30 p-3 text-[10px] text-[var(--text-secondary)]">
+                {pluginReadRaw}
+              </pre>
+            ) : null}
+            <div className="grid gap-3 border-t border-white/10 pt-3">
+              <div className="grid gap-2">
+                <input
+                  value={commandInput}
+                  onChange={(event) => setCommandInput(event.target.value)}
+                  placeholder="command, e.g. pwd"
+                  className="rounded-md border border-white/10 bg-black/20 px-3 py-2 text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)]"
+                />
+                <input
+                  value={commandCwd}
+                  onChange={(event) => setCommandCwd(event.target.value)}
+                  placeholder="cwd (optional)"
+                  className="rounded-md border border-white/10 bg-black/20 px-3 py-2 text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)]"
+                />
+                <button
+                  onClick={() => onExecCommand(commandInput, commandCwd || null)}
+                  className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+                >
+                  Run command/exec
+                </button>
+                {commandExecRaw ? (
+                  <pre className="max-h-56 overflow-auto rounded-md bg-black/30 p-3 text-[10px] text-[var(--text-secondary)]">
+                    {commandExecRaw}
+                  </pre>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <input
+                  value={fsPath}
+                  onChange={(event) => setFsPath(event.target.value)}
+                  placeholder="filesystem path"
+                  className="rounded-md border border-white/10 bg-black/20 px-3 py-2 text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)]"
+                />
+                <div className="grid gap-2 md:grid-cols-3">
+                  <button
+                    onClick={() => onReadFsDirectory(fsPath)}
+                    className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+                  >
+                    fs/readDirectory
+                  </button>
+                  <button
+                    onClick={() => onReadFsFile(fsPath)}
+                    className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+                  >
+                    fs/readFile
+                  </button>
+                  <button
+                    onClick={() => onReadFsMetadata(fsPath)}
+                    className="rounded-md bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] transition-colors hover:bg-white/10 hover:text-[var(--text-primary)]"
+                  >
+                    fs/getMetadata
+                  </button>
+                </div>
+                {fsDebugRaw ? (
+                  <pre className="max-h-56 overflow-auto rounded-md bg-black/30 p-3 text-[10px] text-[var(--text-secondary)]">
+                    {fsDebugRaw}
+                  </pre>
+                ) : null}
+              </div>
             </div>
           </div>
         </SectionCard>
@@ -130,7 +264,9 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
               <div key={skill.name} className="shell-card p-3">
                 <div className="flex items-center justify-between gap-3">
                   <div className="font-medium text-[var(--text-primary)]">{skill.displayName}</div>
-                  <div className="text-[10px] uppercase text-[var(--text-secondary)]">{skill.enabled ? "enabled" : "disabled"}</div>
+                  <div className="text-[10px] uppercase text-[var(--text-secondary)]">
+                    {skill.enabled ? "enabled" : "disabled"}
+                  </div>
                 </div>
                 <div className="mt-1 text-xs text-[var(--text-secondary)]">${skill.name}</div>
                 <div className="mt-2 text-xs text-[var(--text-secondary)]">{skill.description || "无描述"}</div>
@@ -148,10 +284,13 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
                 <div className="flex items-center justify-between gap-3">
                   <div className="font-medium text-[var(--text-primary)]">{plugin.displayName}</div>
                   <div className="text-[10px] uppercase text-[var(--text-secondary)]">
-                    {plugin.installed ? "installed" : "available"} · {plugin.enabled ? "enabled" : "disabled"}
+                    {plugin.installed ? "installed" : "available"} / {plugin.enabled ? "enabled" : "disabled"}
                   </div>
                 </div>
-                <div className="mt-1 text-xs text-[var(--text-secondary)]">{plugin.name}{plugin.category ? ` · ${plugin.category}` : ""}</div>
+                <div className="mt-1 text-xs text-[var(--text-secondary)]">
+                  {plugin.name}
+                  {plugin.category ? ` / ${plugin.category}` : ""}
+                </div>
                 <div className="mt-2 text-xs text-[var(--text-secondary)]">{plugin.description || "无描述"}</div>
               </div>
             ))}
@@ -205,7 +344,7 @@ export function SettingsPanel({ settings, catalog, activeSection, onSectionChang
                 <div className="flex items-center justify-between gap-3">
                   <div className="font-medium text-[var(--text-primary)]">{feature.displayName}</div>
                   <div className="text-[10px] uppercase text-[var(--text-secondary)]">
-                    {feature.stage} · {feature.enabled ? "enabled" : "disabled"}
+                    {feature.stage} / {feature.enabled ? "enabled" : "disabled"}
                   </div>
                 </div>
                 <div className="mt-1 text-xs text-[var(--text-secondary)]">{feature.name}</div>

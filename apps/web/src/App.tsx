@@ -38,9 +38,19 @@ export default function App() {
   const [language, setLanguage] = useState<LanguageMode>("zh");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("overview");
   const {
+    bootstrapped,
     loading,
     error,
     snapshot,
+    loginPending,
+    loginAuthUrl,
+    loginId,
+    loginMessage,
+    appServerAppsRaw,
+    pluginReadRaw,
+    mcpReloadRaw,
+    commandExecRaw,
+    fsDebugRaw,
     approvalHistory,
     selectedThreadId,
     threadDetail,
@@ -52,13 +62,26 @@ export default function App() {
     createThread,
     refreshLoadedThreads,
     refreshAppServerCatalog,
+    refreshAppServerApps,
+    readPluginDetail,
+    reloadMcpConfig,
+    execCommandDebug,
+    readFsFileDebug,
+    readFsDirectoryDebug,
+    readFsMetadataDebug,
     sendPrompt,
     interruptTurn,
-    addWorkspace,
+    pickWorkspace,
     selectWorkspace,
+    renameThread,
+    archiveThread,
+    compactThread,
+    rollbackThread,
+    runThreadShellCommand,
     resolveApproval,
     handleEvent,
     login,
+    cancelLogin,
     logout
   } = useAppStore();
 
@@ -72,6 +95,10 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    if (!bootstrapped) {
+      return;
+    }
+
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
@@ -96,14 +123,14 @@ export default function App() {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [handleEvent]);
+  }, [bootstrapped, handleEvent]);
 
   const t = useMemo(
     () =>
       language === "zh"
         ? {
             currentWorkspace: "当前工作区",
-            notSelected: "无",
+            notSelected: "未选择",
             workspace: "工作区列表",
             threads: "线程",
             account: "账户",
@@ -144,6 +171,13 @@ export default function App() {
     setLeftTab((prev) => (prev === tab ? null : tab));
   };
 
+  const loginMessageText = loginMessage ?? "";
+  const showLoginHelpLink =
+    Boolean(loginMessage) &&
+    (loginMessageText.includes("localhost:1455") ||
+      loginMessageText.includes("API key 登录") ||
+      loginMessageText.includes("登录回调服务"));
+
   const handleSlashCommand = (command: SlashCommandId) => {
     if (command === "new") {
       void createThread();
@@ -182,7 +216,40 @@ export default function App() {
       setSettingsSection("experimental");
       return;
     }
-    if (command === "runtime" || command === "compact") {
+    if (command === "compact") {
+      if (!selectedThreadId) {
+        return;
+      }
+      void compactThread(selectedThreadId);
+      return;
+    }
+    if (command === "rollback") {
+      if (!selectedThreadId) {
+        return;
+      }
+      const raw = window.prompt("Rollback how many turns?", "1");
+      if (raw === null) {
+        return;
+      }
+      const turnCount = Number(raw);
+      if (!Number.isFinite(turnCount) || turnCount <= 0) {
+        return;
+      }
+      void rollbackThread(selectedThreadId, Math.floor(turnCount));
+      return;
+    }
+    if (command === "shell") {
+      if (!selectedThreadId) {
+        return;
+      }
+      const commandText = window.prompt("Run shell command in current thread");
+      if (!commandText?.trim()) {
+        return;
+      }
+      void runThreadShellCommand(selectedThreadId, commandText.trim(), threadDetail?.cwd ?? null);
+      return;
+    }
+    if (command === "runtime") {
       return;
     }
   };
@@ -331,16 +398,31 @@ export default function App() {
                   onCreate={() => void createThread()}
                   onRefreshLatest={() => void refreshLoadedThreads()}
                   onSelect={(threadId) => void selectThread(threadId)}
+                  onRename={(threadId) => {
+                    const thread = snapshot.threads.find((entry) => entry.id === threadId);
+                    const nextName = window.prompt("Rename thread", thread?.name ?? thread?.preview ?? "");
+                    if (nextName === null) {
+                      return;
+                    }
+                    void renameThread(threadId, nextName.trim() || null);
+                  }}
+                  onArchive={(threadId) => {
+                    const confirmed = window.confirm("Archive this thread?");
+                    if (!confirmed) {
+                      return;
+                    }
+                    void archiveThread(threadId);
+                  }}
                 />
               )}
 
               {leftTab === "workspace" && (
-                <WorkspaceSelector
-                  workspace={snapshot.workspace}
-                  allowedRoots={snapshot.settings.allowedWorkspaces}
-                  onAdd={(path) => addWorkspace(path)}
-                  onSelect={(path) => selectWorkspace(path)}
-                />
+                    <WorkspaceSelector
+                      workspace={snapshot.workspace}
+                      allowedRoots={snapshot.settings.allowedWorkspaces}
+                      onPick={() => pickWorkspace()}
+                      onSelect={(path) => selectWorkspace(path)}
+                    />
               )}
 
               {leftTab === "account" && (
@@ -360,10 +442,10 @@ export default function App() {
                     <div className="mt-4 space-y-2 text-xs text-text-secondary mb-4 pb-4 border-b border-border">
                        <div className="flex justify-between"><span>{t.accountMode}:</span> <span>{snapshot.account.mode}</span></div>
                        <div className="flex justify-between"><span>{t.accountPlan}:</span> <span>{snapshot.account.planType ?? "-"}</span></div>
-                       <div className="flex justify-between"><span>主额度:</span> <span>{formatRateLimitWindow(rateLimits?.primary)}</span></div>
-                       <div className="flex justify-between"><span>主额度重置:</span> <span>{formatResetAt(rateLimits?.primary?.resetsAt) ?? "-"}</span></div>
-                       <div className="flex justify-between"><span>副额度:</span> <span>{formatRateLimitWindow(rateLimits?.secondary)}</span></div>
-                       <div className="flex justify-between"><span>副额度重置:</span> <span>{formatResetAt(rateLimits?.secondary?.resetsAt) ?? "-"}</span></div>
+                       <div className="flex justify-between"><span>主额度</span> <span>{formatRateLimitWindow(rateLimits?.primary)}</span></div>
+                       <div className="flex justify-between"><span>主额度重置</span> <span>{formatResetAt(rateLimits?.primary?.resetsAt) ?? "-"}</span></div>
+                       <div className="flex justify-between"><span>副额度</span> <span>{formatRateLimitWindow(rateLimits?.secondary)}</span></div>
+                       <div className="flex justify-between"><span>副额度重置</span> <span>{formatResetAt(rateLimits?.secondary?.resetsAt) ?? "-"}</span></div>
                        <div className="flex justify-between"><span>Credits:</span> <span>{rateLimits?.creditsRemaining ?? "-"}</span></div>
                     </div>
 
@@ -376,12 +458,53 @@ export default function App() {
                         {t.accountLogout}
                       </button>
                     ) : (
-                      <button
-                        onClick={() => void login()}
-                        className="w-full flex items-center justify-center gap-2 py-2 text-sm bg-accent text-white hover:bg-accent/80 rounded transition-colors"
-                      >
-                        {t.accountLogin}
-                      </button>
+                      <div className="space-y-3">
+                        <button
+                          onClick={() => void login()}
+                          disabled={loginPending}
+                          className="w-full flex items-center justify-center gap-2 py-2 text-sm bg-accent text-white hover:bg-accent/80 rounded transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {loginPending ? "Starting login..." : t.accountLogin}
+                        </button>
+                        {loginMessage && (
+                          <div className="rounded border border-white/10 bg-white/5 px-3 py-2 text-xs text-text-secondary space-y-2">
+                            <div>{loginMessage}</div>
+                            {showLoginHelpLink && (
+                              <button
+                                onClick={() => window.open("/help/windows-login-10013", "_blank", "noopener,noreferrer")}
+                                className="w-full rounded bg-white/5 px-3 py-2 text-left text-text-primary hover:bg-white/10"
+                              >
+                                查看处理说明
+                              </button>
+                            )}
+                          </div>
+                        )}
+                        {loginAuthUrl && (
+                          <div className="rounded border border-accent/20 bg-accent/5 p-3 text-xs text-text-secondary space-y-2">
+                            <p className="text-text-primary">Login link is ready.</p>
+                            <button
+                              onClick={() => window.open(loginAuthUrl, "_blank", "noopener,noreferrer")}
+                              className="w-full rounded bg-white/5 px-3 py-2 text-left text-text-primary hover:bg-white/10"
+                            >
+                              Open login link
+                            </button>
+                            <button
+                              onClick={() => void navigator.clipboard.writeText(loginAuthUrl)}
+                              className="w-full rounded bg-white/5 px-3 py-2 text-left hover:bg-white/10"
+                            >
+                              Copy login link
+                            </button>
+                            {loginId && (
+                              <button
+                                onClick={() => void cancelLogin()}
+                                className="w-full rounded bg-red-500/10 px-3 py-2 text-left text-red-300 hover:bg-red-500/20"
+                              >
+                                Cancel login
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     )}
                   </div>
                 </div>
@@ -493,13 +616,51 @@ export default function App() {
                 />
               ) : null}
               {rightTab === "settings" ? (
-                <SettingsPanel
-                  settings={snapshot.settings}
-                  catalog={snapshot.appServerCatalog}
-                  activeSection={settingsSection}
-                  onSectionChange={setSettingsSection}
-                  onRefreshCatalog={() => void refreshAppServerCatalog()}
-                />
+              <SettingsPanel 
+                settings={snapshot.settings}
+                catalog={snapshot.appServerCatalog}
+                activeSection={settingsSection}
+                onSectionChange={setSettingsSection}
+                onRefreshCatalog={() => void refreshAppServerCatalog()}
+                onRefreshApps={() => void refreshAppServerApps()}
+                onReloadMcp={() => void reloadMcpConfig()}
+                onReadPlugin={() => {
+                  const plugin = snapshot.appServerCatalog.plugins[0];
+                  if (!plugin) {
+                    return;
+                  }
+                  void readPluginDetail(".", plugin.name);
+                }}
+                onExecCommand={(command, cwd) => {
+                  if (!command.trim()) {
+                    return;
+                  }
+                  void execCommandDebug(command.trim(), cwd);
+                }}
+                onReadFsFile={(path) => {
+                  if (!path.trim()) {
+                    return;
+                  }
+                  void readFsFileDebug(path.trim());
+                }}
+                onReadFsDirectory={(path) => {
+                  if (!path.trim()) {
+                    return;
+                  }
+                  void readFsDirectoryDebug(path.trim());
+                }}
+                onReadFsMetadata={(path) => {
+                  if (!path.trim()) {
+                    return;
+                  }
+                  void readFsMetadataDebug(path.trim());
+                }}
+                appServerAppsRaw={appServerAppsRaw}
+                pluginReadRaw={pluginReadRaw}
+                mcpReloadRaw={mcpReloadRaw}
+                commandExecRaw={commandExecRaw}
+                fsDebugRaw={fsDebugRaw}
+              />
               ) : null}
             </div>
           </aside>
@@ -510,3 +671,4 @@ export default function App() {
     </div>
   );
 }
+

@@ -1,6 +1,7 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 
 type JsonRpcId = string | number;
 
@@ -61,9 +62,17 @@ export class CodexAppServerClient extends EventEmitter {
       args: this.options.args
     });
 
-    this.child = spawn(this.options.command, this.options.args, {
+    const spawnSpec = this.resolveSpawnSpec();
+    this.options.logger.log("app_server.spawn", {
+      command: spawnSpec.command,
+      args: spawnSpec.args,
+      shell: spawnSpec.shell
+    });
+
+    this.child = spawn(spawnSpec.command, spawnSpec.args, {
       env: this.options.env,
-      stdio: "pipe"
+      stdio: "pipe",
+      shell: spawnSpec.shell
     });
 
     this.child.on("error", (error) => {
@@ -147,6 +156,24 @@ export class CodexAppServerClient extends EventEmitter {
       id,
       error: { code: -32000, message, data }
     });
+  }
+
+  private resolveSpawnSpec(): { command: string; args: string[]; shell: boolean } {
+    const command = this.options.command.trim();
+    const args = [...this.options.args];
+    const isWindows = process.platform === "win32";
+    const extension = path.extname(command).toLowerCase();
+    const needsCmdShim = isWindows && (extension === ".cmd" || extension === ".bat");
+
+    if (!needsCmdShim) {
+      return { command, args, shell: false };
+    }
+
+    return {
+      command,
+      args,
+      shell: true
+    };
   }
 
   private async initialize(): Promise<void> {

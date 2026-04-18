@@ -102,9 +102,15 @@ function resolveCodexCommand(
   explicitCommand: string | undefined,
   cwd: string
 ): { command: string; source: "explicit" | "local" | "global" } {
-  if (explicitCommand?.trim()) {
+  const normalizedExplicitCommand = explicitCommand?.trim();
+  const isGenericCodexCommand =
+    normalizedExplicitCommand === "codex" ||
+    normalizedExplicitCommand === "codex.cmd" ||
+    normalizedExplicitCommand === "codex.exe";
+
+  if (normalizedExplicitCommand && !isGenericCodexCommand) {
     return {
-      command: explicitCommand.trim(),
+      command: normalizedExplicitCommand,
       source: "explicit"
     };
   }
@@ -124,7 +130,7 @@ function resolveCodexCommand(
   }
 
   return {
-    command: "codex",
+    command: process.platform === "win32" ? "codex.cmd" : "codex",
     source: "global"
   };
 }

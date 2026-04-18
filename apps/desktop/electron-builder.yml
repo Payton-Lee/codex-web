@@ -9,8 +9,13 @@ files:
 extraResources:
   - from: bundle/web
     to: web
+  - from: bundle/codex
+    to: codex
 asarUnpack:
+  - bundle/server/**/*
+  - node_modules/bindings/**/*
   - node_modules/better-sqlite3/**/*
+  - node_modules/file-uri-to-path/**/*
 win:
   signAndEditExecutable: false
   target:
