@@ -114,10 +114,7 @@ export class WorkspaceGuard {
 
   ensureAllowed(workspacePath: string): string {
     const normalized = path.resolve(workspacePath);
-    const matched = this.allowedWorkspaces.some((allowed) => {
-      const normalizedAllowed = path.resolve(allowed);
-      return normalized === normalizedAllowed || normalized.startsWith(`${normalizedAllowed}${path.sep}`);
-    });
+    const matched = this.isWithinConfiguredRoots(normalized) || this.isRegisteredWorkspace(normalized);
     if (!matched) {
       throw new Error(`工作目录不在白名单中: ${normalized}`);
     }
@@ -125,7 +122,10 @@ export class WorkspaceGuard {
   }
 
   setCurrentWorkspace(workspacePath: string, sourceType = "manual_select"): string {
-    const normalized = this.ensureAllowed(workspacePath);
+    const normalized =
+      sourceType === "folder_picker"
+        ? this.ensureDirectoryWorkspace(workspacePath)
+        : this.ensureAllowed(workspacePath);
     const workspaceId = this.upsertWorkspace(normalized, sourceType);
     this.currentWorkspace = normalized;
     this.setCurrentWorkspaceId(workspaceId);
@@ -133,7 +133,10 @@ export class WorkspaceGuard {
   }
 
   addWorkspace(workspacePath: string, sourceType = "manual_input"): string {
-    const normalized = this.ensureAllowed(workspacePath);
+    const normalized =
+      sourceType === "folder_picker"
+        ? this.ensureDirectoryWorkspace(workspacePath)
+        : this.ensureAllowed(workspacePath);
     const workspaceId = this.upsertWorkspace(normalized, sourceType);
     if (!this.currentWorkspace) {
       this.currentWorkspace = normalized;
@@ -144,6 +147,34 @@ export class WorkspaceGuard {
 
   private workspaceIdForPath(workspacePath: string): string {
     return stableUuid(`workspace:${normalizeAllowedPath(workspacePath)}`);
+  }
+
+  private isWithinConfiguredRoots(workspacePath: string): boolean {
+    return this.allowedWorkspaces.some((allowed) => {
+      const normalizedAllowed = path.resolve(allowed);
+      return workspacePath === normalizedAllowed || workspacePath.startsWith(`${normalizedAllowed}${path.sep}`);
+    });
+  }
+
+  private isRegisteredWorkspace(workspacePath: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS matched FROM workspaces WHERE canonical_path = ? LIMIT 1")
+      .get(workspacePath) as { matched?: number } | undefined;
+    return Boolean(row?.matched);
+  }
+
+  private ensureDirectoryWorkspace(workspacePath: string): string {
+    const normalized = path.resolve(workspacePath);
+    let stats: fs.Stats;
+    try {
+      stats = fs.statSync(normalized);
+    } catch {
+      throw new Error(`工作目录不存在: ${normalized}`);
+    }
+    if (!stats.isDirectory()) {
+      throw new Error(`选择的路径不是文件夹: ${normalized}`);
+    }
+    return normalized;
   }
 
   private upsertWorkspace(workspacePath: string, sourceType: string): string {

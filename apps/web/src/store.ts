@@ -23,6 +23,43 @@ type LiveItemState = {
 type DeltaMap = Record<string, LiveItemState>;
 type PendingPrompt = { threadId: string; prompt: string } | null;
 const SESSION_QUERY_KEY = "sid";
+let threadDetailRequestSeq = 0;
+const latestThreadDetailRequestByThread = new Map<string, number>();
+const inFlightThreadDetailRequests = new Map<string, Promise<void>>();
+const queuedThreadDetailRefreshes = new Map<string, number>();
+const pendingThreadDetailRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const pendingThreadListRefreshTimers = new Map<"threads" | "loaded", ReturnType<typeof setTimeout>>();
+const queuedLiveDeltaPayloads = new Map<
+  string,
+  {
+    threadId: string;
+    turnId: string;
+    itemId: string;
+    stream: "assistant" | "command" | "fileChange" | "reasoning";
+    delta: string;
+  }
+>();
+let liveDeltaFlushHandle: number | null = null;
+let latestResolvedSessionTarget: string | null = null;
+let latestResolvedSessionSummary: SessionSummary | null = null;
+let inFlightResolvedSessionTarget: string | null = null;
+let inFlightResolvedSessionRequest: Promise<SessionSummary> | null = null;
+
+function debugLog(scope: string, payload: Record<string, unknown>): void {
+  console.debug(`[chat-debug] ${scope}`, payload);
+}
+
+function hasInProgressTurn(detail: ThreadDetail | null | undefined): boolean {
+  return detail?.turns.some((turn) => turn.status === "inProgress") ?? false;
+}
+
+function isThreadSettled(detail: ThreadDetail | null | undefined): boolean {
+  return Boolean(detail && !hasInProgressTurn(detail));
+}
+
+function isTransientThreadDetailError(message: string): boolean {
+  return message.includes("rollout") && message.includes("is empty");
+}
 
 function readSessionIdFromUrl(): string | null {
   const params = new URLSearchParams(window.location.search);
@@ -169,12 +206,36 @@ function pruneLiveDeltasForDetail(liveDeltas: DeltaMap, detail: ThreadDetail): D
   const completedItemIds = new Set(
     detail.turns.flatMap((turn) => turn.items.map((item) => item.id))
   );
-  if (completedItemIds.size === 0) {
+  const settledTurnIds = new Set(
+    detail.turns
+      .filter((turn) => turn.status !== "inProgress")
+      .map((turn) => turn.id)
+  );
+  if (completedItemIds.size === 0 && settledTurnIds.size === 0) {
     return liveDeltas;
   }
-  return Object.fromEntries(
-    Object.entries(liveDeltas).filter(([itemId, delta]) => delta.threadId !== detail.id || !completedItemIds.has(itemId))
+  const nextLiveDeltas = Object.fromEntries(
+    Object.entries(liveDeltas).filter(([itemId, delta]) => {
+      if (delta.threadId !== detail.id) {
+        return true;
+      }
+      if (completedItemIds.has(itemId)) {
+        return false;
+      }
+      if (settledTurnIds.has(delta.turnId)) {
+        return false;
+      }
+      return true;
+    })
   );
+  debugLog("pruneLiveDeltasForDetail", {
+    threadId: detail.id,
+    completedItemIds: [...completedItemIds],
+    settledTurnIds: [...settledTurnIds],
+    liveDeltaIdsBefore: Object.keys(liveDeltas).filter((itemId) => liveDeltas[itemId]?.threadId === detail.id),
+    liveDeltaIdsAfter: Object.keys(nextLiveDeltas).filter((itemId) => nextLiveDeltas[itemId]?.threadId === detail.id)
+  });
+  return nextLiveDeltas;
 }
 
 function mergeLiveItemText(item: ThreadItem, text: string): ThreadItem {
@@ -188,14 +249,171 @@ function mergeLiveItemText(item: ThreadItem, text: string): ThreadItem {
   };
 }
 
+function flushQueuedLiveDeltas(): void {
+  liveDeltaFlushHandle = null;
+  if (queuedLiveDeltaPayloads.size === 0) {
+    return;
+  }
+  const queued = Array.from(queuedLiveDeltaPayloads.values());
+  queuedLiveDeltaPayloads.clear();
+  debugLog("flushQueuedLiveDeltas", {
+    items: queued.map((payload) => ({
+      threadId: payload.threadId,
+      turnId: payload.turnId,
+      itemId: payload.itemId,
+      stream: payload.stream,
+      deltaLength: payload.delta.length
+    }))
+  });
+  useAppStore.setState((state) => {
+    let nextLiveDeltas = state.liveDeltas;
+    let mutated = false;
+    for (const payload of queued) {
+      const previous = nextLiveDeltas[payload.itemId];
+      const mergedText = `${previous?.text ?? ""}${payload.delta}`;
+      const nextItem = mergeLiveItemText(
+        previous?.item ?? {
+          id: payload.itemId,
+          type:
+            payload.stream === "assistant"
+              ? "agentMessage"
+              : payload.stream === "reasoning"
+                ? "reasoning"
+                : payload.stream === "command"
+                  ? "commandExecution"
+                  : "fileChange"
+        },
+        mergedText
+      );
+      if (!mutated) {
+        nextLiveDeltas = { ...nextLiveDeltas };
+        mutated = true;
+      }
+      nextLiveDeltas[payload.itemId] = {
+        stream: payload.stream,
+        text: mergedText,
+        threadId: payload.threadId,
+        turnId: payload.turnId,
+        item: nextItem
+      };
+    }
+    return mutated ? { liveDeltas: nextLiveDeltas } : state;
+  });
+}
+
+function scheduleLiveDeltaFlush(): void {
+  if (liveDeltaFlushHandle !== null) {
+    return;
+  }
+  const schedule =
+    typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
+      ? window.requestAnimationFrame.bind(window)
+      : (callback: FrameRequestCallback) => window.setTimeout(() => callback(Date.now()), 16);
+  liveDeltaFlushHandle = schedule(() => {
+    flushQueuedLiveDeltas();
+  });
+}
+
+function enqueueLiveDelta(payload: {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  stream: "assistant" | "command" | "fileChange" | "reasoning";
+  delta: string;
+}): void {
+  debugLog("enqueueLiveDelta", {
+    threadId: payload.threadId,
+    turnId: payload.turnId,
+    itemId: payload.itemId,
+    stream: payload.stream,
+    delta: payload.delta
+  });
+  const existing = queuedLiveDeltaPayloads.get(payload.itemId);
+  if (existing) {
+    existing.delta += payload.delta;
+    existing.stream = payload.stream;
+    existing.threadId = payload.threadId;
+    existing.turnId = payload.turnId;
+  } else {
+    queuedLiveDeltaPayloads.set(payload.itemId, { ...payload });
+  }
+  scheduleLiveDeltaFlush();
+}
+
+function scheduleThreadListRefresh(kind: "threads" | "loaded", delayMs = 240): void {
+  const existingTimer = pendingThreadListRefreshTimers.get(kind);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+  const timer = setTimeout(() => {
+    pendingThreadListRefreshTimers.delete(kind);
+    const store = useAppStore.getState();
+    if (kind === "loaded") {
+      void store.refreshLoadedThreads();
+      return;
+    }
+    void store.refreshThreads();
+  }, delayMs);
+  pendingThreadListRefreshTimers.set(kind, timer);
+}
+
+function scheduleThreadDetailRefresh(threadId: string, delayMs = 120): void {
+  const inFlightRequest = inFlightThreadDetailRequests.get(threadId);
+  if (inFlightRequest) {
+    const currentQueuedDelay = queuedThreadDetailRefreshes.get(threadId);
+    queuedThreadDetailRefreshes.set(
+      threadId,
+      currentQueuedDelay === undefined ? delayMs : Math.min(currentQueuedDelay, delayMs)
+    );
+    return;
+  }
+  const existingTimer = pendingThreadDetailRefreshTimers.get(threadId);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+  const timer = setTimeout(() => {
+    pendingThreadDetailRefreshTimers.delete(threadId);
+    void useAppStore
+      .getState()
+      .refreshCurrentThreadDetail(threadId)
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        debugLog("refreshCurrentThreadDetail.rejected", { threadId, message });
+      });
+  }, delayMs);
+  pendingThreadDetailRefreshTimers.set(threadId, timer);
+}
+
 async function resolveActiveSession(
   snapshot: SnapshotPayload | null,
   threadId: string | null
 ): Promise<SessionSummary | null> {
   if (!snapshot?.account.loggedIn || !snapshot.account.email || !snapshot.workspace.current) {
+    latestResolvedSessionTarget = null;
+    latestResolvedSessionSummary = null;
     return null;
   }
-  return api.resolveSession(snapshot.workspace.current, threadId);
+  const target = `${snapshot.account.email.trim().toLowerCase()}|${snapshot.workspace.current}|${threadId ?? ""}`;
+  if (latestResolvedSessionTarget === target && latestResolvedSessionSummary) {
+    return latestResolvedSessionSummary;
+  }
+  if (inFlightResolvedSessionTarget === target && inFlightResolvedSessionRequest) {
+    return inFlightResolvedSessionRequest;
+  }
+  const request = api.resolveSession(snapshot.workspace.current, threadId);
+  inFlightResolvedSessionTarget = target;
+  inFlightResolvedSessionRequest = request;
+  try {
+    const resolved = await request;
+    latestResolvedSessionTarget = target;
+    latestResolvedSessionSummary = resolved;
+    return resolved;
+  } finally {
+    if (inFlightResolvedSessionTarget === target) {
+      inFlightResolvedSessionTarget = null;
+      inFlightResolvedSessionRequest = null;
+    }
+  }
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -305,40 +523,90 @@ export const useAppStore = create<AppState>((set, get) => ({
     );
   },
   refreshCurrentThreadDetail: async (threadId) => {
-    set({ threadDetailRefreshing: true, error: null });
-    try {
-      const detail = await api.threadDetail(threadId);
-      set((state) => ({
-        threadDetail: detail,
-        threadDetailRefreshing: false,
-        liveDeltas: pruneLiveDeltasForDetail(state.liveDeltas, detail),
-        activeTurnId:
-          detail.turns.find((turn) => turn.status === "inProgress")?.id ??
-          detail.turns.at(-1)?.id ??
-          null,
-        pendingPrompt:
-          state.pendingPrompt &&
-          state.pendingPrompt.threadId === threadId &&
-          detailContainsPrompt(detail, state.pendingPrompt.prompt)
-            ? null
-            : state.pendingPrompt
-      }));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? null;
-      if (message.includes("is not materialized yet") && summary) {
-        set((state) => ({
-          threadDetail: state.threadDetail?.id === threadId ? state.threadDetail : emptyDetailFromSummary(summary),
-          threadDetailRefreshing: false,
-          activeTurnId: state.activeTurnId,
-          pendingPrompt:
-            state.pendingPrompt && state.pendingPrompt.threadId === threadId ? state.pendingPrompt : null
-        }));
-        return;
-      }
-      set({ threadDetailRefreshing: false, error: message });
-      throw error;
+    const existingTimer = pendingThreadDetailRefreshTimers.get(threadId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      pendingThreadDetailRefreshTimers.delete(threadId);
     }
+    const inFlightRequest = inFlightThreadDetailRequests.get(threadId);
+    if (inFlightRequest) {
+      queuedThreadDetailRefreshes.set(threadId, 120);
+      return inFlightRequest;
+    }
+    const requestId = ++threadDetailRequestSeq;
+    latestThreadDetailRequestByThread.set(threadId, requestId);
+    set({ threadDetailRefreshing: true, error: null });
+    const request = (async () => {
+      try {
+        const detail = await api.threadDetail(threadId);
+        if (latestThreadDetailRequestByThread.get(threadId) !== requestId) {
+          return;
+        }
+        if (get().selectedThreadId !== threadId) {
+          return;
+        }
+        debugLog("refreshCurrentThreadDetail.received", {
+          threadId,
+          turnIds: detail.turns.map((turn) => turn.id),
+          itemIds: detail.turns.flatMap((turn) => turn.items.map((item) => item.id)),
+          statuses: detail.turns.map((turn) => turn.status)
+        });
+        set((state) => ({
+          threadDetail: detail,
+          threadDetailRefreshing: false,
+          liveDeltas: pruneLiveDeltasForDetail(state.liveDeltas, detail),
+          activeTurnId: detail.turns.find((turn) => turn.status === "inProgress")?.id ?? null,
+          pendingPrompt:
+            state.pendingPrompt &&
+            state.pendingPrompt.threadId === threadId &&
+            (detailContainsPrompt(detail, state.pendingPrompt.prompt) || isThreadSettled(detail))
+              ? null
+              : state.pendingPrompt
+        }));
+        if (hasInProgressTurn(detail)) {
+          scheduleThreadDetailRefresh(threadId, 2500);
+        }
+      } catch (error) {
+        if (latestThreadDetailRequestByThread.get(threadId) !== requestId) {
+          return;
+        }
+        if (get().selectedThreadId !== threadId) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? null;
+        if (message.includes("is not materialized yet") && summary) {
+          set((state) => ({
+            threadDetail: state.threadDetail?.id === threadId ? state.threadDetail : emptyDetailFromSummary(summary),
+            threadDetailRefreshing: false,
+            activeTurnId: state.activeTurnId,
+            pendingPrompt:
+              state.pendingPrompt && state.pendingPrompt.threadId === threadId ? state.pendingPrompt : null
+          }));
+          return;
+        }
+        const shouldRetry =
+          isTransientThreadDetailError(message) &&
+          (get().pendingPrompt?.threadId === threadId || hasInProgressTurn(get().threadDetail));
+        if (shouldRetry) {
+          debugLog("refreshCurrentThreadDetail.retry", { threadId, message });
+          set({ threadDetailRefreshing: false, error: null });
+          scheduleThreadDetailRefresh(threadId, 1200);
+          return;
+        }
+        set({ threadDetailRefreshing: false, error: message });
+        throw error;
+      } finally {
+        inFlightThreadDetailRequests.delete(threadId);
+        const queuedDelay = queuedThreadDetailRefreshes.get(threadId);
+        if (queuedDelay !== undefined) {
+          queuedThreadDetailRefreshes.delete(threadId);
+          scheduleThreadDetailRefresh(threadId, queuedDelay);
+        }
+      }
+    })();
+    inFlightThreadDetailRequests.set(threadId, request);
+    return request;
   },
   selectThread: async (threadId) => {
     set({
@@ -393,10 +661,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ error: message });
       throw new Error(message);
     }
+    const currentPendingPrompt = get().pendingPrompt;
+    if (currentPendingPrompt && currentPendingPrompt.threadId === currentThreadId) {
+      return;
+    }
     set({ error: null, pendingPrompt: { threadId: currentThreadId, prompt: trimmedPrompt } });
     try {
       const result = await api.sendPrompt(currentThreadId, trimmedPrompt);
       set({ activeTurnId: result.turnId });
+      scheduleThreadDetailRefresh(currentThreadId);
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -714,6 +987,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (event.type === "thread.status") {
+      debugLog("event.thread.status", event.payload);
       set((state) =>
         state.snapshot
           ? {
@@ -732,6 +1006,12 @@ export const useAppStore = create<AppState>((set, get) => ({
             }
           : state
       );
+      if (event.payload.threadId === get().selectedThreadId) {
+        if (event.payload.status !== "inProgress") {
+          scheduleThreadDetailRefresh(event.payload.threadId, 160);
+        }
+      }
+      scheduleThreadListRefresh("loaded", 320);
       return;
     }
 
@@ -820,44 +1100,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (event.type === "item.delta") {
-      set((state) => ({
-        liveDeltas: {
-          ...state.liveDeltas,
-          [event.payload.itemId]: {
-            ...state.liveDeltas[event.payload.itemId],
-            stream: event.payload.stream,
-            text: `${state.liveDeltas[event.payload.itemId]?.text ?? ""}${event.payload.delta}`,
-            threadId: event.payload.threadId,
-            turnId: event.payload.turnId,
-            item: mergeLiveItemText(
-              state.liveDeltas[event.payload.itemId]?.item ?? {
-                id: event.payload.itemId,
-                type: event.payload.stream === "assistant"
-                  ? "agentMessage"
-                  : event.payload.stream === "reasoning"
-                    ? "reasoning"
-                    : event.payload.stream === "command"
-                      ? "commandExecution"
-                      : "fileChange"
-              },
-              `${state.liveDeltas[event.payload.itemId]?.text ?? ""}${event.payload.delta}`
-            )
-          }
-        }
-      }));
+      enqueueLiveDelta(event.payload);
       return;
     }
 
     if (event.type === "turn.started") {
-      void get().refreshLoadedThreads();
       set({ activeTurnId: event.payload.turnId });
-      if (event.payload.threadId === get().selectedThreadId) {
-        void get().refreshCurrentThreadDetail(event.payload.threadId);
-      }
+      scheduleThreadListRefresh("loaded", 320);
       return;
     }
 
     if (event.type === "item.started" || event.type === "item.completed") {
+      debugLog(`event.${event.type}`, {
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        itemId: event.payload.item.id,
+        itemType: event.payload.item.type,
+        itemText: event.payload.item.text ?? null,
+        aggregatedOutput: event.payload.item.aggregatedOutput ?? null
+      });
       if (event.payload.item.type !== "userMessage") {
         set((state) => ({
           liveDeltas: {
@@ -885,40 +1146,39 @@ export const useAppStore = create<AppState>((set, get) => ({
         }));
       }
       if (event.payload.threadId === get().selectedThreadId) {
-        set((state) => ({
-          pendingPrompt:
-            state.pendingPrompt?.threadId === event.payload.threadId ? null : state.pendingPrompt
-        }));
-        void get().refreshCurrentThreadDetail(event.payload.threadId);
+        if (event.payload.item.type === "userMessage") {
+          scheduleThreadDetailRefresh(event.payload.threadId, 160);
+        }
       } else {
-        void get().refreshThreads();
+        scheduleThreadListRefresh("threads", 420);
       }
       return;
     }
 
     if (event.type === "diff.updated") {
       if (event.payload.threadId === get().selectedThreadId) {
-        void get().refreshCurrentThreadDetail(event.payload.threadId);
+        scheduleThreadDetailRefresh(event.payload.threadId);
       }
       return;
     }
 
     if (event.type === "turn.completed") {
+      debugLog("event.turn.completed", event.payload);
       if (event.payload.threadId === get().selectedThreadId) {
-        void get().refreshCurrentThreadDetail(event.payload.threadId);
+        scheduleThreadDetailRefresh(event.payload.threadId, 120);
       }
       set((state) => ({
         activeTurnId: null,
-        liveDeltas: {},
+        liveDeltas: state.liveDeltas,
         pendingPrompt:
-          state.pendingPrompt?.threadId === event.payload.threadId ? null : state.pendingPrompt
+          state.pendingPrompt && state.pendingPrompt.threadId === event.payload.threadId ? null : state.pendingPrompt
       }));
-      void get().refreshLoadedThreads();
+      scheduleThreadListRefresh("loaded", 180);
       return;
     }
 
     if (event.type === "thread.started") {
-      void get().refreshLoadedThreads();
+      scheduleThreadListRefresh("loaded", 320);
       return;
     }
 

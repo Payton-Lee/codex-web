@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
@@ -98,6 +99,32 @@ function resolvePathSetting(value: string | undefined, fallbackRelativePath: str
     : path.resolve(rootDir, fallbackRelativePath);
 }
 
+function resolveCodexHomeDir(dataDir: string): {
+  codexHomeDir: string;
+  codexHomeStrategy: "user" | "isolated" | "explicit";
+} {
+  const explicitHomeDir = process.env.CODEX_HOME_DIR?.trim();
+  if (explicitHomeDir) {
+    return {
+      codexHomeDir: path.resolve(explicitHomeDir),
+      codexHomeStrategy: "explicit"
+    };
+  }
+
+  const configuredStrategy = process.env.CODEX_HOME_STRATEGY?.trim().toLowerCase();
+  if (configuredStrategy === "isolated") {
+    return {
+      codexHomeDir: path.resolve(dataDir, "codex-home"),
+      codexHomeStrategy: "isolated"
+    };
+  }
+
+  return {
+    codexHomeDir: path.resolve(os.homedir(), ".codex"),
+    codexHomeStrategy: "user"
+  };
+}
+
 function resolveCodexCommand(
   explicitCommand: string | undefined,
   cwd: string
@@ -156,6 +183,7 @@ const appServerPort = parseNumber(process.env.APP_SERVER_PORT, fileConfig.appSer
 const auditLogDir = resolvePathSetting(process.env.AUDIT_LOG_DIR, "logs");
 const dataDir = resolvePathSetting(process.env.DATA_DIR, "data");
 const webStaticDir = resolvePathSetting(process.env.CODEX_WEB_STATIC_DIR, "apps/web/dist");
+const resolvedCodexHome = resolveCodexHomeDir(dataDir);
 const resolvedCodexCommand = resolveCodexCommand(
   process.env.CODEX_APP_SERVER_COMMAND ?? fileConfig.codexCommand,
   rootDir
@@ -211,11 +239,13 @@ export const appConfig = {
   codexCommand: resolvedCodexCommand.command,
   codexCommandSource: resolvedCodexCommand.source,
   codexArgs,
-  codexHomeDir: process.env.CODEX_HOME_DIR
-    ? path.resolve(process.env.CODEX_HOME_DIR)
-    : undefined,
+  codexHomeDir: resolvedCodexHome.codexHomeDir,
+  codexHomeStrategy: resolvedCodexHome.codexHomeStrategy,
   codexConfigOverrideSources,
   codexConfigOverrides,
+  codexAppServerPassthroughEnv: parseList(process.env.CODEX_APP_SERVER_PASSTHROUGH_ENV)
+    .map((entry) => entry.trim())
+    .filter(Boolean),
   allowedWorkspaces,
   defaultWorkspace,
   allowedOrigins,

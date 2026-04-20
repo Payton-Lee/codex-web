@@ -565,6 +565,7 @@ export default function App() {
                 language={language}
                 workspaceName={projectName}
                 canSend={Boolean(selectedThreadId)}
+                sending={Boolean(pendingPrompt && pendingPrompt.threadId === selectedThreadId)}
                 appServerCatalog={snapshot.appServerCatalog}
               />
           </div>

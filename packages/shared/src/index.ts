@@ -179,6 +179,8 @@ export interface SettingsSummary {
   codexCommand: string;
   codexCommandSource: "explicit" | "local" | "global";
   codexArgs: string[];
+  codexBinaryVersion?: string | null;
+  codexHomeStrategy?: "user" | "isolated" | "explicit";
   codexHomeDir?: string;
   effectiveCodexHomeDir: string;
   codexConfigOverrideSources: string[];

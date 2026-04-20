@@ -67,11 +67,19 @@ export function ThreadSidebar({
         <div className="space-y-1">
           {threads.length === 0 && <p className="px-3 text-xs italic text-text-secondary">暂无线程</p>}
           {threads.map((thread) => (
-            <button
+            <div
               key={thread.id}
+              role="button"
+              tabIndex={0}
               onClick={() => onSelect(thread.id)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onSelect(thread.id);
+                }
+              }}
               className={cn(
-                "flex w-full flex-col gap-1.5 rounded-lg border px-3 py-2.5 text-left text-sm transition-colors",
+                "flex w-full cursor-pointer flex-col gap-1.5 rounded-lg border px-3 py-2.5 text-left text-sm transition-colors focus:outline-none focus:ring-1 focus:ring-accent/40",
                 selectedThreadId === thread.id
                   ? "border-accent/20 bg-accent/10"
                   : "border-transparent text-text-secondary hover:bg-white/5 hover:text-text-primary"
@@ -128,7 +136,7 @@ export function ThreadSidebar({
                   </button>
                 </div>
               )}
-            </button>
+            </div>
           ))}
         </div>
       </div>

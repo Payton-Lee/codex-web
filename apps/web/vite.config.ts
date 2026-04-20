@@ -15,6 +15,18 @@ const fileConfig = fs.existsSync(configPath)
 const host = process.env.HOST ?? fileConfig.host ?? "127.0.0.1";
 const webPort = Number(process.env.WEB_PORT ?? fileConfig.webPort ?? 10000);
 const serverPort = Number(process.env.SERVER_PORT ?? fileConfig.serverPort ?? 9000);
+const backendTarget = `http://${host}:${serverPort}`;
+
+function silenceTransientProxySocketErrors(proxy: {
+  on(event: string, listener: (error: NodeJS.ErrnoException) => void): void;
+}): void {
+  proxy.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "ECONNABORTED" || error.code === "ECONNRESET") {
+      return;
+    }
+    console.error("[vite-proxy]", error);
+  });
+}
 
 export default defineConfig({
   plugins: [react()],
@@ -28,16 +40,17 @@ export default defineConfig({
     port: webPort,
     proxy: {
       "/api": {
-        target: `http://${host}:${serverPort}`,
+        target: backendTarget,
         changeOrigin: false
       },
       "/help": {
-        target: `http://${host}:${serverPort}`,
+        target: backendTarget,
         changeOrigin: false
       },
       "/ws": {
-        target: `ws://${host}:${serverPort}`,
-        ws: true
+        target: backendTarget,
+        ws: true,
+        configure: silenceTransientProxySocketErrors
       }
     }
   }

@@ -68,6 +68,7 @@ export function SettingsPanel({
   const [fsPath, setFsPath] = useState("");
   const refreshedAtLabel = catalog.refreshedAt ? new Date(catalog.refreshedAt).toLocaleString() : "尚未刷新";
   const codexArgs = settings.codexArgs ?? [];
+  const codexBinaryVersion = settings.codexBinaryVersion ?? "Unknown";
   const effectiveCodexHomeDir = settings.effectiveCodexHomeDir ?? settings.codexHomeDir ?? "~/.codex";
   const codexConfigOverrideSources = settings.codexConfigOverrideSources ?? [];
 
@@ -131,6 +132,10 @@ export function SettingsPanel({
             </div>
             <div className="break-all font-mono text-xs text-[var(--text-secondary)]">
               codex: {settings.codexCommand} {codexArgs.join(" ")}
+            </div>
+            <div className="text-xs text-[var(--text-secondary)]">Current Codex CLI: {codexBinaryVersion}</div>
+            <div className="text-[10px] text-[var(--text-secondary)]">
+              Thread `cliVersion` is historical thread metadata and can differ from the current runtime.
             </div>
             <div className="text-xs text-[var(--text-secondary)]">
               来源:

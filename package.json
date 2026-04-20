@@ -25,7 +25,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.24.0",
-    "@openai/codex": "^0.117.0",
+    "@openai/codex": "^0.121.0",
     "@types/node": "^22.14.0",
     "concurrently": "^9.1.2",
     "eslint": "^9.24.0",

@@ -113,7 +113,10 @@ export const api = {
         ...(cwd ? { cwd } : {})
       })
     }),
-  threadDetail: (threadId: string) => request<ThreadDetail>(`/api/threads/${threadId}`),
+  threadDetail: (threadId: string) =>
+    request<ThreadDetail>(`/api/threads/${threadId}`, {
+      cache: "no-store"
+    }),
   searchComposerFiles: (query: string) =>
     request<WorkspaceFileSuggestion[]>(`/api/composer/files?query=${encodeURIComponent(query)}`),
   searchComposerSkills: (query: string) =>

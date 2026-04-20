@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawnSync } from "node:child_process";
 import express, { Request, Response } from "express";
 import { WebSocketServer } from "ws";
 import {
@@ -309,6 +310,121 @@ function normalizeMcpServerStatusEntries(
     }>;
 }
 
+const DEFAULT_APP_SERVER_ENV_ALLOWLIST = [
+  "APPDATA",
+  "COMMONPROGRAMFILES",
+  "COMMONPROGRAMFILES(X86)",
+  "COMMONPROGRAMW6432",
+  "COMPUTERNAME",
+  "COMSPEC",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LOCALAPPDATA",
+  "NODE",
+  "NODE_EXTRA_CA_CERTS",
+  "NVM_HOME",
+  "NVM_SYMLINK",
+  "NUMBER_OF_PROCESSORS",
+  "OS",
+  "PATH",
+  "PATHEXT",
+  "PROCESSOR_ARCHITECTURE",
+  "PROCESSOR_IDENTIFIER",
+  "PROCESSOR_LEVEL",
+  "PROCESSOR_REVISION",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "TERM",
+  "TMP",
+  "TZ",
+  "USERNAME",
+  "USERPROFILE",
+  "WINDIR"
+] as const;
+
+function buildAppServerEnv() {
+  const env: NodeJS.ProcessEnv = {};
+  const retainedKeys = new Set<string>();
+  const strippedCodexEnvKeys: string[] = [];
+  const droppedParentEnvKeys: string[] = [];
+  const extraPassthroughKeys = appConfig.codexAppServerPassthroughEnv.map((entry) => entry.toUpperCase());
+  const allowlist = new Set<string>(
+    [...DEFAULT_APP_SERVER_ENV_ALLOWLIST, ...extraPassthroughKeys].map((entry) => entry.toUpperCase())
+  );
+
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value == null) {
+      continue;
+    }
+
+    if (key.startsWith("CODEX_")) {
+      strippedCodexEnvKeys.push(key);
+      continue;
+    }
+
+    if (allowlist.has(key.toUpperCase())) {
+      env[key] = value;
+      retainedKeys.add(key);
+      continue;
+    }
+
+    droppedParentEnvKeys.push(key);
+  }
+
+  fs.mkdirSync(appConfig.codexHomeDir, { recursive: true });
+  env.CODEX_HOME = appConfig.codexHomeDir;
+
+  return {
+    env,
+    retainedEnvKeys: Array.from(retainedKeys).sort(),
+    strippedCodexEnvKeys: strippedCodexEnvKeys.sort(),
+    droppedParentEnvKeys: droppedParentEnvKeys.sort()
+  };
+}
+
+function detectCodexBinaryVersion(command: string, env: NodeJS.ProcessEnv, logger: AuditLogger): string | null {
+  const normalizedCommand = command.trim();
+  const extension = path.extname(normalizedCommand).toLowerCase();
+  const needsCmdShim = process.platform === "win32" && (extension === ".cmd" || extension === ".bat");
+
+  try {
+    const result = spawnSync(normalizedCommand, ["--version"], {
+      env,
+      encoding: "utf8",
+      shell: needsCmdShim,
+      timeout: 5000
+    });
+    const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
+    const match = combinedOutput.match(/codex-cli\s+([0-9A-Za-z.+-]+)/i);
+    const version = match?.[1] ?? null;
+    logger.log("app_server.version.detected", {
+      command: normalizedCommand,
+      version,
+      shell: needsCmdShim,
+      status: result.status,
+      signal: result.signal
+    });
+    return version;
+  } catch (error) {
+    logger.log("app_server.version.detect_failed", {
+      command: normalizedCommand,
+      message: error instanceof Error ? error.message : String(error)
+    });
+    return null;
+  }
+}
+
 export function createApp() {
   fs.mkdirSync(appConfig.auditLogDir, { recursive: true });
   const logger = new AuditLogger(appConfig.auditLogDir);
@@ -318,13 +434,17 @@ export function createApp() {
     appConfig.workspaceDbPath
   );
   const sessionStore = new SessionStore(appConfig.workspaceDbPath);
-  const env = {
-    ...process.env
-  };
-  if (appConfig.codexHomeDir) {
-    fs.mkdirSync(appConfig.codexHomeDir, { recursive: true });
-    env.CODEX_HOME = appConfig.codexHomeDir;
-  }
+  const { env, retainedEnvKeys, strippedCodexEnvKeys, droppedParentEnvKeys } = buildAppServerEnv();
+  const codexBinaryVersion = detectCodexBinaryVersion(appConfig.codexCommand, env, logger);
+  logger.log("app_server.env.prepared", {
+    codexHomeStrategy: appConfig.codexHomeStrategy,
+    codexHomeDir: appConfig.codexHomeDir,
+    codexBinaryVersion,
+    passthroughEnvKeys: retainedEnvKeys,
+    strippedCodexEnvKeys,
+    droppedParentEnvKeyCount: droppedParentEnvKeys.length,
+    droppedParentEnvKeysSample: droppedParentEnvKeys.slice(0, 40)
+  });
   const client = new CodexAppServerClient({
     command: appConfig.codexCommand,
     args: [...appConfig.codexArgs, ...appConfig.codexConfigOverrides.flatMap((entry) => ["-c", entry])],
@@ -385,6 +505,8 @@ export function createApp() {
       codexCommand: appConfig.codexCommand,
       codexCommandSource: appConfig.codexCommandSource,
       codexArgs: appConfig.codexArgs,
+      codexBinaryVersion,
+      codexHomeStrategy: appConfig.codexHomeStrategy,
       codexHomeDir: appConfig.codexHomeDir,
       effectiveCodexHomeDir: appConfig.codexHomeDir ?? path.join(os.homedir(), ".codex"),
       codexConfigOverrideSources: appConfig.codexConfigOverrideSources,
