@@ -1730,8 +1730,8 @@ export function createApp() {
     }
     await ensureClientReady();
     const pathValue = String(req.body?.path ?? "").trim();
-    const dataBase64 = String(req.body?.dataBase64 ?? "").trim();
-    if (!pathValue || !dataBase64) {
+    const dataBase64 = typeof req.body?.dataBase64 === "string" ? req.body.dataBase64 : null;
+    if (!pathValue || dataBase64 === null) {
       res.status(400).json({ error: "path and dataBase64 are required" });
       return;
     }

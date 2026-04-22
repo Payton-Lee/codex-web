@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Bot,
   FileCode,
+  FileText,
   Files,
   Languages,
   LogOut,
@@ -11,12 +12,15 @@ import {
   PanelRightOpen,
   Settings,
   Sun,
-  User
+  User,
+  X
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { ApprovalDrawer } from "./components/ApprovalDrawer";
 import { ChatView } from "./components/ChatView";
 import { DiffViewer } from "./components/DiffViewer";
+import { FileEditorTab } from "./components/FileEditorTab";
+import { FilesPanel } from "./components/FilesPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ThreadSidebar } from "./components/ThreadSidebar";
 import { WorkspaceSelector } from "./components/WorkspaceSelector";
@@ -30,6 +34,10 @@ type LeftTab = "threads" | "workspace" | "account" | "files" | null;
 type ThemeMode = "dark" | "light";
 type LanguageMode = "zh" | "en";
 type SettingsSection = "overview" | "skills" | "plugins" | "models" | "modes" | "experimental";
+type FileOpenMode = "preview" | "pinned";
+type CenterTab =
+  | { id: "chat"; type: "chat"; title: string }
+  | { id: string; type: "file"; title: string; path: string; pinned: boolean };
 
 export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>("diff");
@@ -37,6 +45,8 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("dark");
   const [language, setLanguage] = useState<LanguageMode>("zh");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("overview");
+  const [centerTabs, setCenterTabs] = useState<CenterTab[]>([{ id: "chat", type: "chat", title: "Chat" }]);
+  const [activeCenterTabId, setActiveCenterTabId] = useState("chat");
   const {
     bootstrapped,
     loading,
@@ -304,6 +314,72 @@ export default function App() {
   const workspaceThreads = currentWorkspace
     ? snapshot.threads.filter((thread) => isThreadInWorkspace(thread.cwd, currentWorkspace))
     : snapshot.threads;
+  const activeCenterTab = centerTabs.find((tab) => tab.id === activeCenterTabId) ?? centerTabs[0];
+  const openFileTab = (file: { path: string; name: string }, mode: FileOpenMode = "preview") => {
+    const pinnedTabId = `file:${file.path}`;
+    const existingPinnedTab = centerTabs.find((tab) => tab.type === "file" && tab.path === file.path && tab.pinned);
+    const nextActiveTabId = existingPinnedTab?.id ?? (mode === "pinned" ? pinnedTabId : "file-preview");
+    setCenterTabs((tabs) => {
+      if (existingPinnedTab) {
+        return tabs;
+      }
+      if (mode === "preview") {
+        const previewTab = {
+          id: "file-preview",
+          type: "file" as const,
+          title: file.name,
+          path: file.path,
+          pinned: false
+        };
+        return tabs.some((tab) => tab.id === "file-preview")
+          ? tabs.map((tab) => (tab.id === "file-preview" ? previewTab : tab))
+          : [...tabs, previewTab];
+      }
+      return [
+        ...tabs.filter((tab) => !(tab.id === "file-preview" && tab.type === "file" && tab.path === file.path)),
+        {
+          id: pinnedTabId,
+          type: "file",
+          title: file.name,
+          path: file.path,
+          pinned: true
+        }
+      ];
+    });
+    setActiveCenterTabId(nextActiveTabId);
+  };
+  const promoteFileTab = (path: string) => {
+    const pinnedTabId = `file:${path}`;
+    setCenterTabs((tabs) => {
+      if (tabs.some((tab) => tab.id === pinnedTabId)) {
+        return tabs.filter((tab) => tab.id !== "file-preview" || tab.type !== "file" || tab.path !== path);
+      }
+      return tabs.map((tab) =>
+        tab.id === "file-preview" && tab.type === "file" && tab.path === path
+          ? {
+              ...tab,
+              id: pinnedTabId,
+              pinned: true
+            }
+          : tab
+      );
+    });
+    setActiveCenterTabId(pinnedTabId);
+  };
+  const closeCenterTab = (tabId: string) => {
+    if (tabId === "chat") {
+      return;
+    }
+    setCenterTabs((tabs) => {
+      const nextTabs = tabs.filter((tab) => tab.id !== tabId);
+      if (activeCenterTabId === tabId) {
+        const closedIndex = tabs.findIndex((tab) => tab.id === tabId);
+        const fallback = nextTabs[Math.max(0, closedIndex - 1)] ?? nextTabs[0];
+        setActiveCenterTabId(fallback?.id ?? "chat");
+      }
+      return nextTabs.length > 0 ? nextTabs : [{ id: "chat", type: "chat", title: "Chat" }];
+    });
+  };
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-chat-bg text-text-primary theme-transition">
@@ -382,11 +458,7 @@ export default function App() {
                 <div className="flex-1 overflow-y-auto w-full no-scrollbar pb-6 p-4">
               
               {leftTab === "files" && (
-                <div className="flex flex-col items-center justify-center text-center py-10 opacity-70">
-                  <Files size={40} className="mx-auto text-text-secondary/30 mb-2" />
-                  <p className="text-sm text-text-secondary mt-2">文件资源管理器</p>
-                  <p className="text-[10px] text-text-secondary/60 mt-1">暂未接入</p>
-                </div>
+                <FilesPanel rootPath={currentWorkspace} onOpenFile={openFileTab} />
               )}
 
               {leftTab === "threads" && (
@@ -548,26 +620,85 @@ export default function App() {
         <div className="flex-1 flex min-h-0 min-w-0">
           
             <div className="flex-1 min-w-0 flex flex-col">
-              <ChatView
-                detail={threadDetail}
-                liveDeltas={liveDeltas}
-                pendingPrompt={
-                  pendingPrompt && pendingPrompt.threadId === selectedThreadId
-                    ? pendingPrompt.prompt
-                    : null
-                }
-                detailRefreshing={threadDetailRefreshing}
-                onSend={sendPrompt}
-                onInterrupt={() => {
-                  void interruptTurn();
-                }}
-                onSlashCommand={handleSlashCommand}
-                language={language}
-                workspaceName={projectName}
-                canSend={Boolean(selectedThreadId)}
-                sending={Boolean(pendingPrompt && pendingPrompt.threadId === selectedThreadId)}
-                appServerCatalog={snapshot.appServerCatalog}
-              />
+              <div className="h-11 shrink-0 border-b border-border bg-sidebar/40 px-2 flex items-end gap-1 overflow-x-auto no-scrollbar">
+                {centerTabs.map((tab) => (
+                  <div
+                    key={tab.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setActiveCenterTabId(tab.id)}
+                    onAuxClick={(event) => {
+                      if (event.button === 1 && tab.type === "file") {
+                        event.preventDefault();
+                        closeCenterTab(tab.id);
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setActiveCenterTabId(tab.id);
+                      }
+                    }}
+                    className={cn(
+                      "group mb-1 flex max-w-[220px] cursor-pointer items-center gap-2 rounded-t-lg border border-transparent px-3 py-1.5 text-xs transition-colors",
+                      activeCenterTab?.id === tab.id
+                        ? "border-border bg-bg text-text-primary"
+                        : "text-text-secondary hover:bg-white/5 hover:text-text-primary"
+                    )}
+                    title={tab.type === "file" ? tab.path : tab.title}
+                  >
+                    {tab.type === "chat" ? <MessageSquare size={14} /> : <FileText size={14} />}
+                    <span className={cn("truncate", tab.type === "file" && !tab.pinned && "italic")}>
+                      {tab.title}
+                    </span>
+                    {tab.type === "file" ? (
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          closeCenterTab(tab.id);
+                        }}
+                        className="rounded p-0.5 opacity-60 hover:bg-white/10 hover:opacity-100"
+                        title="Close"
+                      >
+                        <X size={12} />
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+              <div className="min-h-0 flex-1">
+                {activeCenterTab?.type === "file" ? (
+                  <FileEditorTab
+                    key={activeCenterTab.path}
+                    path={activeCenterTab.path}
+                    name={activeCenterTab.title}
+                    preview={!activeCenterTab.pinned}
+                    onPromote={() => promoteFileTab(activeCenterTab.path)}
+                  />
+                ) : (
+                  <ChatView
+                    detail={threadDetail}
+                    liveDeltas={liveDeltas}
+                    pendingPrompt={
+                      pendingPrompt && pendingPrompt.threadId === selectedThreadId
+                        ? pendingPrompt.prompt
+                        : null
+                    }
+                    detailRefreshing={threadDetailRefreshing}
+                    onSend={sendPrompt}
+                    onInterrupt={() => {
+                      void interruptTurn();
+                    }}
+                    onSlashCommand={handleSlashCommand}
+                    language={language}
+                    workspaceName={projectName}
+                    canSend={Boolean(selectedThreadId)}
+                    sending={Boolean(pendingPrompt && pendingPrompt.threadId === selectedThreadId)}
+                    appServerCatalog={snapshot.appServerCatalog}
+                  />
+                )}
+              </div>
           </div>
 
           <aside className="hidden xl:flex w-[42%] flex-shrink-0 bg-sidebar border-l border-border flex-col shadow-inner min-w-0">

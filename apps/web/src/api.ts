@@ -147,6 +147,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path })
     }),
+  fsWriteFile: (path: string, dataBase64: string) =>
+    request<unknown>("/api/fs/write-file", {
+      method: "POST",
+      body: JSON.stringify({ path, dataBase64 })
+    }),
+  fsCreateDirectory: (path: string, recursive = true) =>
+    request<unknown>("/api/fs/create-directory", {
+      method: "POST",
+      body: JSON.stringify({ path, recursive })
+    }),
   fsReadDirectory: (path: string) =>
     request<unknown>("/api/fs/read-directory", {
       method: "POST",
@@ -156,6 +166,26 @@ export const api = {
     request<unknown>("/api/fs/metadata", {
       method: "POST",
       body: JSON.stringify({ path })
+    }),
+  fsRemove: (path: string, recursive = false, force = false) =>
+    request<unknown>("/api/fs/remove", {
+      method: "POST",
+      body: JSON.stringify({ path, recursive, force })
+    }),
+  fsCopy: (source: string, destination: string, recursive = false) =>
+    request<unknown>("/api/fs/copy", {
+      method: "POST",
+      body: JSON.stringify({ source, destination, recursive })
+    }),
+  fsWatch: (path: string, watchId: string) =>
+    request<unknown>("/api/fs/watch", {
+      method: "POST",
+      body: JSON.stringify({ path, watchId })
+    }),
+  fsUnwatch: (watchId: string) =>
+    request<unknown>("/api/fs/unwatch", {
+      method: "POST",
+      body: JSON.stringify({ watchId })
     }),
   sendPrompt: (threadId: string, prompt: string) =>
     request<{ turnId: string }>(`/api/threads/${threadId}/turns`, {
