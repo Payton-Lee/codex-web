@@ -110,6 +110,13 @@ export interface ThreadDetail extends ThreadSummary {
   turns: TurnSummary[];
 }
 
+export interface ThreadHistoryPage {
+  threadId: string;
+  turns: TurnSummary[];
+  hasMore: boolean;
+  nextBeforeTurnId: string | null;
+}
+
 export interface FileChangeEntry {
   path: string;
   kind: string;
@@ -315,6 +322,15 @@ export const PROMPT_COMMANDS: PromptCommandDefinition[] = [
 export type FrontendEvent =
   | { type: "snapshot"; payload: SnapshotPayload }
   | { type: "account.updated"; payload: AccountSummary }
+  | {
+      type: "command.exec.delta";
+      payload: {
+        processId: string;
+        stream: "stdout" | "stderr";
+        deltaBase64: string;
+        capReached: boolean;
+      };
+    }
   | { type: "thread.started"; payload: { threadId: string } }
   | { type: "thread.status"; payload: { threadId: string; status: ThreadStatus } }
   | { type: "thread.archived"; payload: { threadId: string } }

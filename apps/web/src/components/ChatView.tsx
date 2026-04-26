@@ -7,10 +7,14 @@ import {
     Terminal,
     ChevronDown,
     ChevronUp,
+    ChevronRight,
+    Copy,
+    Check,
     ArrowDown,
     User,
 } from 'lucide-react';
 import { motion } from 'motion/react';
+import { useCallback } from 'react';
 import type {
     AppServerCatalog,
     SkillSuggestion,
@@ -36,6 +40,11 @@ import {
 } from '../lib/composer';
 
 type ThreadTurn = ThreadDetail['turns'][0];
+const TOP_PRELOAD_THRESHOLD_PX = 48;
+const AUTO_PRELOAD_COOLDOWN_MS = 900;
+const AUTO_PRELOAD_SUPPRESS_AFTER_RESTORE_MS = 800;
+const INITIAL_HISTORY_AUTOLOAD_TURN_COUNT = 5;
+const MIN_SCROLL_TOP_TO_RESTORE_PX = 120;
 
 interface Props {
     detail: ThreadDetail | null;
@@ -51,6 +60,9 @@ interface Props {
     >;
     pendingPrompt?: string | null;
     detailRefreshing?: boolean;
+    historyHasMore?: boolean;
+    historyLoadingMore?: boolean;
+    onLoadOlderTurns?(): void;
     onSend(prompt: string): Promise<void> | void;
     onInterrupt(): void;
     onSlashCommand?(command: SlashCommandId): void;
@@ -182,12 +194,290 @@ const GlobalMarkdownComponents: Components = {
     },
 };
 
+function itemBadgeLabel(
+    item: ThreadTurn['items'][number] | ThreadItem,
+    language: 'zh' | 'en' = 'zh',
+): string {
+    if (item.type === 'agentMessage') {
+        return language === 'zh' ? '助手' : 'Assistant';
+    }
+    if (item.type === 'reasoning') {
+        return language === 'zh' ? '思考' : 'Reasoning';
+    }
+    if (item.type === 'commandExecution') {
+        return language === 'zh' ? '命令' : 'Command';
+    }
+    if (item.type === 'fileChange') {
+        return language === 'zh' ? '文件变更' : 'File Change';
+    }
+    return item.type;
+}
+
+function summarizeBlockText(text: string, maxLines = 2, maxChars = 140): string {
+    const normalized = text.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+        return '';
+    }
+    const lines = normalized.split('\n');
+    const clippedLines = lines.slice(0, maxLines).join('\n');
+    const clipped = clippedLines.slice(0, maxChars);
+    return clipped.length < normalized.length ? `${clipped}...` : clipped;
+}
+
+function shouldCollapseBlock(text: string, minLines = 8, minChars = 320): boolean {
+    const normalized = text.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+        return false;
+    }
+    const lines = normalized.split('\n').length;
+    return lines >= minLines || normalized.length >= minChars;
+}
+
+function executionSummaryText(
+    command: string | undefined,
+    output: string | undefined,
+    language: 'zh' | 'en',
+): string {
+    const preferred = (output && output.trim()) || (command && command.trim()) || '';
+    if (!preferred) {
+        return language === 'zh' ? '暂无执行内容' : 'No execution content';
+    }
+    return summarizeBlockText(preferred, 2, 120);
+}
+
+function executionTypeLabel(
+    command: string | undefined,
+    output: string | undefined,
+    language: 'zh' | 'en',
+): string {
+    if (command && output) {
+        return language === 'zh' ? '命令 + 输出' : 'Command + Output';
+    }
+    if (output) {
+        return language === 'zh' ? '输出' : 'Output';
+    }
+    if (command) {
+        return language === 'zh' ? '命令' : 'Command';
+    }
+    return language === 'zh' ? '结果' : 'Result';
+}
+
+const ExpandableTextBlock = memo(function ExpandableTextBlock({
+    label,
+    text,
+    tone = 'secondary',
+    language,
+    className,
+    forceCollapsed = false,
+}: {
+    label: string;
+    text: string;
+    tone?: 'primary' | 'secondary';
+    language: 'zh' | 'en';
+    className?: string;
+    forceCollapsed?: boolean;
+}) {
+    const [expanded, setExpanded] = useState(false);
+    const collapsible = forceCollapsed || shouldCollapseBlock(text);
+    const summary = summarizeBlockText(text);
+
+    return (
+        <div
+            className={cn(
+                'overflow-hidden rounded-2xl bg-[color:color-mix(in_srgb,var(--chat-card-muted)_52%,transparent)]',
+                className,
+            )}
+        >
+            {collapsible && !expanded ? (
+                <button
+                    type="button"
+                    onClick={() => setExpanded(true)}
+                    className="flex w-full items-start gap-2 px-3 py-2 text-left hover:bg-white/[0.03]"
+                >
+                    <ChevronRight size={14} className="mt-0.5 shrink-0 text-accent" />
+                    <div className="min-w-0 flex-1">
+                        <div className="mb-1 flex items-center gap-2">
+                            <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary">
+                                {label}
+                            </span>
+                            <span className="text-[10px] text-text-secondary/70">
+                                {language === 'zh' ? '点击展开' : 'Click to expand'}
+                            </span>
+                        </div>
+                        <pre
+                            className={cn(
+                                'overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-5',
+                                tone === 'primary'
+                                    ? 'text-text-primary'
+                                    : 'text-text-secondary',
+                            )}
+                        >
+                            {summary}
+                        </pre>
+                    </div>
+                </button>
+            ) : (
+                <>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            if (collapsible) {
+                                setExpanded((current) => !current);
+                            }
+                        }}
+                        className={cn(
+                            'flex w-full items-center gap-2 px-3 py-2 text-left',
+                            collapsible
+                                ? 'cursor-pointer hover:bg-white/[0.03]'
+                                : 'cursor-default',
+                        )}
+                    >
+                        {collapsible ? (
+                            <ChevronDown size={14} className="shrink-0 text-accent" />
+                        ) : (
+                            <span className="h-3.5 w-3.5 shrink-0" />
+                        )}
+                        <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-text-secondary">
+                            {label}
+                        </span>
+                        {collapsible ? (
+                            <span className="ml-auto text-[11px] text-text-secondary">
+                                {language === 'zh' ? '收起' : 'Collapse'}
+                            </span>
+                        ) : null}
+                    </button>
+                    <pre
+                        className={cn(
+                            'overflow-auto whitespace-pre-wrap px-3 pb-3 font-mono text-xs',
+                            tone === 'primary'
+                                ? 'text-text-primary'
+                                : 'text-text-secondary',
+                        )}
+                    >
+                        {text}
+                    </pre>
+                </>
+            )}
+        </div>
+    );
+});
+
+const CommandResultCard = memo(function CommandResultCard({
+    command,
+    output,
+    language,
+    className,
+}: {
+    command?: string;
+    output?: string;
+    language: 'zh' | 'en';
+    className?: string;
+}) {
+    const [expanded, setExpanded] = useState(false);
+    const [copied, setCopied] = useState(false);
+    const summary = executionSummaryText(command, output, language);
+    const typeLabel = executionTypeLabel(command, output, language);
+    const copyPayload = [command?.trim(), output?.trim()].filter(Boolean).join('\n\n');
+
+    const handleCopy = async () => {
+        if (!copyPayload) {
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(copyPayload);
+            setCopied(true);
+            window.setTimeout(() => {
+                setCopied(false);
+            }, 1200);
+        } catch {
+            setCopied(false);
+        }
+    };
+
+    return (
+        <div
+            className={cn(
+                'overflow-hidden rounded-2xl bg-[color:color-mix(in_srgb,var(--chat-card-soft)_38%,var(--chat-card-muted))] ring-1 ring-white/[0.04]',
+                className,
+            )}
+        >
+            <div className="flex items-center gap-2 px-3 py-2">
+                <button
+                    type="button"
+                    onClick={() => setExpanded((current) => !current)}
+                    className="flex min-w-0 flex-1 items-start gap-2 text-left hover:text-text-primary"
+                >
+                    {expanded ? (
+                        <ChevronDown size={14} className="mt-0.5 shrink-0 text-accent" />
+                    ) : (
+                        <ChevronRight size={14} className="mt-0.5 shrink-0 text-accent" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                        <div className="mb-1 flex items-center gap-2">
+                            <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary">
+                                {language === 'zh' ? '结果' : 'Result'}
+                            </span>
+                            <span className="rounded-full bg-white/[0.04] px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-[0.08em] text-text-secondary/80">
+                                {typeLabel}
+                            </span>
+                            <span className="text-[10px] text-text-secondary/70">
+                                {expanded
+                                    ? language === 'zh'
+                                        ? '点击收起'
+                                        : 'Click to collapse'
+                                    : language === 'zh'
+                                      ? '点击展开'
+                                      : 'Click to expand'}
+                            </span>
+                        </div>
+                        <pre className="overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-text-primary/88">
+                            {summary}
+                        </pre>
+                    </div>
+                </button>
+                {copyPayload ? (
+                    <button
+                        type="button"
+                        onClick={handleCopy}
+                        className="rounded-md p-1.5 text-text-secondary transition-colors hover:bg-white/[0.05] hover:text-text-primary"
+                        title={language === 'zh' ? '复制结果' : 'Copy result'}
+                    >
+                        {copied ? <Check size={14} /> : <Copy size={14} />}
+                    </button>
+                ) : null}
+            </div>
+
+            {expanded ? (
+                <div className="space-y-3 px-3 pb-3">
+                    {command ? (
+                        <ExpandableTextBlock
+                            label={language === 'zh' ? '命令内容' : 'Command'}
+                            text={command}
+                            tone="primary"
+                            language={language}
+                        />
+                    ) : null}
+                    {output ? (
+                        <ExpandableTextBlock
+                            label={language === 'zh' ? '执行结果' : 'Output'}
+                            text={output}
+                            language={language}
+                        />
+                    ) : null}
+                </div>
+            ) : null}
+        </div>
+    );
+});
+
 const TurnItem = memo(function TurnItem({
     turn,
     isLatest,
+    language,
 }: {
     turn: ThreadTurn;
     isLatest: boolean;
+    language: 'zh' | 'en';
 }) {
     const [expanded, setExpanded] = useState(
         isLatest || turn.status === 'inProgress',
@@ -237,21 +527,21 @@ const TurnItem = memo(function TurnItem({
     }
 
     return (
-        <div className="flex flex-col w-full mb-8 relative px-6">
+        <div className="mx-auto flex w-full max-w-[880px] flex-col gap-5 px-6 pb-6 pt-2">
             {turn.items.map((item) => {
                 const userText = itemDisplayText(item);
                 if (item.type === 'userMessage' && userText) {
                     return (
-                        <div
-                            key={item.id}
-                            className="w-full py-4 text-sm leading-relaxed text-text-primary text-left mb-4"
-                        >
-                            <div className="mb-3 flex items-center gap-2 text-[12px] uppercase tracking-wider text-text-secondary font-semibold">
-                                <User size={14} /> YOU
+                        <div key={item.id} className="flex justify-end">
+                            <div className="max-w-[58%] rounded-[18px] bg-[color:color-mix(in_srgb,var(--chat-card-soft)_58%,transparent)] px-4 py-3 text-left shadow-[0_4px_12px_rgba(0,0,0,0.06)]">
+                                <div className="mb-2 flex items-center justify-end gap-2 text-[11px] font-medium text-text-secondary">
+                                    <span>{language === 'zh' ? '你' : 'You'}</span>
+                                    <User size={13} />
+                                </div>
+                                <pre className="whitespace-pre-wrap font-sans text-[14px] leading-6 text-text-primary">
+                                    {userText}
+                                </pre>
                             </div>
-                            <pre className="whitespace-pre-wrap font-sans text-[15px] text-text-primary/90">
-                                {userText}
-                            </pre>
                         </div>
                     );
                 }
@@ -260,39 +550,49 @@ const TurnItem = memo(function TurnItem({
 
             {hasAIOrCommandItems &&
                 (expanded ? (
-                    <div className="space-y-4 mt-2">
+                    <div className="space-y-4">
                         {turn.items.map((item) => {
                             if (item.type === 'userMessage') return null;
 
                             return (
                                 <div
                                     key={item.id}
-                                    className="relative group w-full py-4 text-sm leading-relaxed text-text-primary text-left"
+                                    className="group relative rounded-[24px] bg-[color:color-mix(in_srgb,var(--chat-card)_38%,transparent)] px-2 py-3 text-left text-sm leading-relaxed text-text-primary shadow-none"
                                 >
                                     {!isLatest && (
                                         <button
                                             onClick={() => setExpanded(false)}
-                                            className="absolute top-3 right-3 p-1.5 bg-white/5 hover:bg-white/10 rounded-md text-text-secondary opacity-0 group-hover:opacity-100 transition-opacity"
-                                            title="折叠卡片"
+                                            className="absolute right-1 top-2 rounded-full bg-white/[0.03] p-1.5 text-text-secondary opacity-0 transition-opacity hover:bg-white/[0.06] group-hover:opacity-100"
+                                            title={
+                                                language === 'zh'
+                                                    ? '折叠'
+                                                    : 'Collapse'
+                                            }
                                         >
                                             <ChevronUp size={14} />
                                         </button>
                                     )}
 
-                                    <div className="mb-2 flex items-center gap-2 text-[12px] uppercase tracking-wider text-accent font-semibold pr-8">
+                                    <div className="mb-3 flex items-center gap-2 pr-8 text-[10px] font-medium tracking-[0.12em] text-text-secondary uppercase">
                                         {item.type === 'agentMessage' ? (
-                                            <Bot size={14} />
+                                            <Bot size={13} className="text-accent" />
                                         ) : null}
                                         {item.type === 'commandExecution' ? (
-                                            <Terminal size={14} />
+                                            <Terminal
+                                                size={13}
+                                                className="text-accent"
+                                            />
                                         ) : null}
                                         {item.type === 'fileChange' ? (
-                                            <FileCode size={14} />
+                                            <FileCode
+                                                size={13}
+                                                className="text-accent"
+                                            />
                                         ) : null}
-                                        {item.type}
+                                        <span>{itemBadgeLabel(item, language)}</span>
                                         {item.status ? (
-                                            <span className="text-text-secondary">
-                                                ({item.status})
+                                            <span className="rounded-full bg-white/[0.04] px-2 py-0.5 normal-case tracking-normal">
+                                                {item.status}
                                             </span>
                                         ) : null}
                                     </div>
@@ -315,34 +615,47 @@ const TurnItem = memo(function TurnItem({
                                             </pre>
                                         )
                                     ) : null}
-                                    {item.command ? (
-                                        <pre className="mb-2 overflow-auto whitespace-pre-wrap font-mono text-xs text-text-primary bg-black/30 p-2 rounded-lg">
-                                            {item.command}
-                                        </pre>
-                                    ) : null}
-                                    {item.aggregatedOutput ? (
-                                        <pre className="overflow-auto whitespace-pre-wrap font-mono text-[11px] text-text-secondary bg-black/20 p-2 rounded-lg">
-                                            {item.aggregatedOutput}
-                                        </pre>
+                                    {item.command || item.aggregatedOutput ? (
+                                        <CommandResultCard
+                                            command={item.command}
+                                            output={
+                                                item.aggregatedOutput ?? undefined
+                                            }
+                                            language={language}
+                                            className="mb-1"
+                                        />
                                     ) : null}
                                     {item.changes?.length ? (
-                                        <div className="space-y-1 mt-2">
+                                        <div className="mt-4 overflow-hidden rounded-2xl bg-[color:color-mix(in_srgb,var(--chat-card-soft)_48%,transparent)]">
+                                            <div className="flex items-center justify-between px-4 py-3 text-sm font-medium text-text-primary">
+                                                <span>
+                                                    {language === 'zh'
+                                                        ? `${item.changes.length} 个文件已变更`
+                                                        : `${item.changes.length} file changes`}
+                                                </span>
+                                                <span className="text-xs text-text-secondary">
+                                                    {language === 'zh'
+                                                        ? '摘要'
+                                                        : 'Summary'}
+                                                </span>
+                                            </div>
+                                            <div className="divide-y divide-white/4">
                                             {item.changes.map((change) => (
                                                 <div
                                                     key={change.path}
-                                                    className="rounded border border-border bg-white/5 px-2 py-1 font-mono text-xs text-text-secondary flex gap-2"
+                                                    className="flex gap-3 px-4 py-3 font-mono text-xs text-text-secondary"
                                                 >
-                                                    <span className="text-accent">
+                                                    <span className="shrink-0 text-accent">
                                                         {displayChangeKind(
                                                             change.kind,
                                                         )}
-                                                        :
                                                     </span>
                                                     <span className="truncate">
                                                         {change.path}
                                                     </span>
                                                 </div>
                                             ))}
+                                            </div>
                                         </div>
                                     ) : null}
                                 </div>
@@ -352,13 +665,13 @@ const TurnItem = memo(function TurnItem({
                 ) : (
                     <button
                         onClick={() => setExpanded(true)}
-                        className="w-full text-left p-3 mt-1 rounded-xl border border-border/50 bg-black/20 text-text-secondary hover:bg-white/5 hover:text-text-primary transition-colors flex items-center gap-3 group shadow-sm"
+                        className="w-full rounded-[20px] bg-[color:color-mix(in_srgb,var(--chat-card)_34%,transparent)] p-4 text-left text-text-secondary shadow-none transition-colors hover:bg-[color:color-mix(in_srgb,var(--chat-card-soft)_54%,transparent)] hover:text-text-primary"
                     >
                         <div className="flex-1 min-w-0">
-                            <p className="text-xs font-medium truncate opacity-70 flex items-center gap-1.5">
+                            <p className="flex items-center gap-2 truncate text-sm font-medium">
                                 <Bot
                                     size={13}
-                                    className="shrink-0 text-accent/80"
+                                    className="shrink-0 text-accent"
                                 />
                                 <span className="truncate">{summaryText}</span>
                             </p>
@@ -377,33 +690,38 @@ const LiveItemCard = memo(function LiveItemCard({
     item,
     stream,
     text,
+    language,
 }: {
     item: ThreadItem;
     stream: string;
     text: string;
+    language: 'zh' | 'en';
 }) {
     const displayText =
         text || itemDisplayText(item as ThreadTurn['items'][number]);
 
     return (
-        <div className="w-full py-4 text-sm leading-relaxed text-text-primary text-left">
-            <div className="mb-2 flex items-center gap-2 text-[12px] uppercase tracking-wider text-accent font-semibold">
-                {item.type === 'agentMessage' ? <Bot size={14} /> : null}
+        <div className="rounded-[24px] bg-[color:color-mix(in_srgb,var(--chat-card)_38%,transparent)] px-2 py-3 text-left text-sm leading-relaxed text-text-primary shadow-none">
+            <div className="mb-4 flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.12em] text-text-secondary">
+                {item.type === 'agentMessage' ? (
+                    <Bot size={13} className="text-accent" />
+                ) : null}
                 {item.type === 'commandExecution' ? (
-                    <Terminal size={14} />
+                    <Terminal size={13} className="text-accent" />
                 ) : null}
-                {item.type === 'fileChange' ? <FileCode size={14} /> : null}
-                <span>{item.type}</span>
+                {item.type === 'fileChange' ? (
+                    <FileCode size={13} className="text-accent" />
+                ) : null}
+                <span>{itemBadgeLabel(item, language)}</span>
                 {item.status ? (
-                    <span className="text-text-secondary">({item.status})</span>
+                    <span className="rounded-full bg-white/[0.04] px-2 py-0.5 normal-case tracking-normal">
+                        {item.status}
+                    </span>
                 ) : null}
-                <span className="ml-auto text-text-secondary">{stream}</span>
+                <span className="ml-auto rounded-full bg-white/[0.04] px-2 py-0.5 normal-case tracking-normal text-text-secondary">
+                    {stream}
+                </span>
             </div>
-            {item.command ? (
-                <pre className="mb-2 overflow-auto whitespace-pre-wrap font-mono text-xs text-text-primary bg-black/30 p-2 rounded-lg">
-                    {item.command}
-                </pre>
-            ) : null}
             {displayText ? (
                 item.type === 'agentMessage' || item.type === 'reasoning' ? (
                     <div className="max-w-none text-text-primary overflow-hidden break-words">
@@ -420,19 +738,27 @@ const LiveItemCard = memo(function LiveItemCard({
                     </pre>
                 )
             ) : null}
-            {item.aggregatedOutput && item.aggregatedOutput !== displayText ? (
-                <pre className="mt-2 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-text-secondary bg-black/20 p-2 rounded-lg">
-                    {item.aggregatedOutput}
-                </pre>
+            {item.command ||
+            (item.aggregatedOutput && item.aggregatedOutput !== displayText) ? (
+                <CommandResultCard
+                    command={item.command}
+                    output={
+                        item.aggregatedOutput && item.aggregatedOutput !== displayText
+                            ? item.aggregatedOutput
+                            : undefined
+                    }
+                    language={language}
+                    className={displayText ? 'mt-3' : 'mb-3'}
+                />
             ) : null}
             {item.changes?.length ? (
-                <div className="space-y-1 mt-2">
+                <div className="mt-4 overflow-hidden rounded-2xl bg-[color:color-mix(in_srgb,var(--chat-card-soft)_48%,transparent)]">
                     {item.changes.map((change) => (
                         <div
                             key={change.path}
-                            className="rounded border border-border bg-white/5 px-2 py-1 font-mono text-xs text-text-secondary flex gap-2"
+                            className="flex gap-3 border-b border-white/4 px-4 py-3 font-mono text-xs text-text-secondary last:border-b-0"
                         >
-                            <span className="text-accent">
+                            <span className="shrink-0 text-accent">
                                 {displayChangeKind(change.kind)}:
                             </span>
                             <span className="truncate">{change.path}</span>
@@ -450,29 +776,29 @@ const ThinkingCard = memo(function ThinkingCard({
     language: 'zh' | 'en';
 }) {
     return (
-        <div className="w-full py-4 text-sm leading-relaxed text-text-primary text-left">
-            <div className="mb-2 flex items-center gap-2 text-[12px] uppercase tracking-wider text-accent font-semibold">
-                <Bot size={14} />
-                <span>{language === 'zh' ? '思考中' : 'thinking'}</span>
-                <span className="ml-auto text-text-secondary">
+        <div className="rounded-[24px] bg-[color:color-mix(in_srgb,var(--chat-card)_38%,transparent)] px-4 py-4 text-left text-sm leading-relaxed text-text-primary shadow-none">
+            <div className="mb-4 flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.12em] text-text-secondary">
+                <Bot size={13} className="text-accent" />
+                <span>{language === 'zh' ? '思考中' : 'Thinking'}</span>
+                <span className="ml-auto rounded-full bg-white/[0.04] px-2 py-0.5 normal-case tracking-normal text-text-secondary">
                     {language === 'zh' ? '请稍候' : 'please wait'}
                 </span>
             </div>
-            <div className="flex items-center gap-1 px-1 py-1">
+            <div className="flex items-center gap-1 py-1">
                 <span
-                    className="h-1.5 w-1.5 rounded-full bg-accent animate-bounce"
+                    className="h-2 w-2 rounded-full bg-accent animate-bounce"
                     style={{ animationDelay: '0ms' }}
                 />
                 <span
-                    className="h-1.5 w-1.5 rounded-full bg-accent animate-bounce"
+                    className="h-2 w-2 rounded-full bg-accent animate-bounce"
                     style={{ animationDelay: '150ms' }}
                 />
                 <span
-                    className="h-1.5 w-1.5 rounded-full bg-accent animate-bounce"
+                    className="h-2 w-2 rounded-full bg-accent animate-bounce"
                     style={{ animationDelay: '300ms' }}
                 />
             </div>
-            <p className="mt-2 text-sm text-text-secondary">
+            <p className="mt-3 text-sm leading-7 text-text-secondary">
                 {language === 'zh'
                     ? '助手正在处理这条消息，回复会在准备好后显示。'
                     : 'The assistant is working on this message and will reply here when ready.'}
@@ -502,6 +828,9 @@ export function ChatView({
     liveDeltas,
     pendingPrompt,
     detailRefreshing = false,
+    historyHasMore = false,
+    historyLoadingMore = false,
+    onLoadOlderTurns,
     onSend,
     onInterrupt,
     onSlashCommand,
@@ -519,7 +848,27 @@ export function ChatView({
     const virtuosoRef = useRef<VirtuosoHandle>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const [atBottom, setAtBottom] = useState(true);
+    const [isNearTop, setIsNearTop] = useState(false);
     const shouldScrollToBottomRef = useRef(false);
+    const prependAnchorTurnIdRef = useRef<string | null>(null);
+    const prependInFlightRef = useRef(false);
+    const initialAutoLoadDoneRef = useRef(false);
+    const lastAutoLoadAtRef = useRef(0);
+    const wasNearTopRef = useRef(false);
+    const lastScrollTopRef = useRef<number | null>(null);
+    const suppressAutoPreloadUntilRef = useRef(0);
+    const savedScrollTopByThreadRef = useRef<Record<string, number>>({});
+    const prependScrollMetricsRef = useRef<{
+        scrollTop: number;
+        scrollHeight: number;
+    } | null>(null);
+    const pendingRestoreScrollTopRef = useRef<number | null>(null);
+
+    const getScroller = useCallback(() => {
+        return document.querySelector<HTMLDivElement>(
+            '.h-full.w-full.custom-scroll',
+        );
+    }, []);
 
     const submitPrompt = async () => {
         const nextPrompt = prompt.trim();
@@ -900,33 +1249,208 @@ export function ChatView({
     const shouldShowEmptyState = !detailRefreshing && mixedData.length === 0;
     const shouldShowScrollToLatestButton = !atBottom && mixedData.length > 0;
 
+    const triggerLoadOlderTurns = useCallback((source: 'manual' | 'auto') => {
+        if (
+            !historyHasMore ||
+            historyLoadingMore ||
+            !turns.length ||
+            prependInFlightRef.current
+        ) {
+            return;
+        }
+        const now = Date.now();
+        if (
+            source === 'auto' &&
+            (now - lastAutoLoadAtRef.current < AUTO_PRELOAD_COOLDOWN_MS ||
+                now < suppressAutoPreloadUntilRef.current)
+        ) {
+            return;
+        }
+        const scroller = getScroller();
+        prependAnchorTurnIdRef.current = turns[0]?.id ?? null;
+        prependScrollMetricsRef.current = scroller
+            ? {
+                  scrollTop: scroller.scrollTop,
+                  scrollHeight: scroller.scrollHeight,
+              }
+            : null;
+        prependInFlightRef.current = true;
+        lastAutoLoadAtRef.current = now;
+        onLoadOlderTurns?.();
+    }, [getScroller, historyHasMore, historyLoadingMore, onLoadOlderTurns, turns]);
+
     useEffect(() => {
         if (detail?.id) {
-            // When thread changes, we want to ensure we are at the absolute bottom
-            // even if dynamic heights (like Markdown) cause layout shifts.
-            const scroller = document.querySelector<HTMLDivElement>(
-                '.h-full.w-full.custom-scroll',
+            const savedScrollTop = savedScrollTopByThreadRef.current[detail.id];
+            if (
+                typeof savedScrollTop === 'number' &&
+                (savedScrollTop > MIN_SCROLL_TOP_TO_RESTORE_PX || !historyHasMore)
+            ) {
+                pendingRestoreScrollTopRef.current = Math.max(
+                    0,
+                    savedScrollTop,
+                );
+            } else {
+                pendingRestoreScrollTopRef.current = null;
+            }
+            suppressAutoPreloadUntilRef.current =
+                Date.now() + AUTO_PRELOAD_SUPPRESS_AFTER_RESTORE_MS;
+        }
+        setIsNearTop(false);
+        wasNearTopRef.current = false;
+        lastScrollTopRef.current = null;
+        prependInFlightRef.current = false;
+        prependAnchorTurnIdRef.current = null;
+        prependScrollMetricsRef.current = null;
+    }, [detail?.id, historyHasMore]);
+
+    useEffect(() => {
+        if (
+            !detail?.id ||
+            detailRefreshing ||
+            turns.length === 0 ||
+            mixedData.length === 0
+        ) {
+            return;
+        }
+        const scroller = getScroller();
+        if (!scroller) {
+            return;
+        }
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                const restoreTop = pendingRestoreScrollTopRef.current;
+                const targetTop =
+                    typeof restoreTop === 'number'
+                        ? restoreTop
+                        : Math.max(
+                              0,
+                              scroller.scrollHeight - scroller.clientHeight - 24,
+                          );
+                scroller.scrollTo({
+                    top: targetTop,
+                    behavior: 'auto',
+                });
+                lastScrollTopRef.current = targetTop;
+                pendingRestoreScrollTopRef.current = null;
+            });
+        });
+    }, [detail?.id, detailRefreshing, getScroller, mixedData.length, turns.length]);
+
+    useEffect(() => {
+        const scroller = getScroller();
+        if (!scroller) {
+            return;
+        }
+
+        const updateNearTop = () => {
+            if (detail?.id) {
+                savedScrollTopByThreadRef.current[detail.id] =
+                    scroller.scrollTop;
+            }
+            const previousScrollTop = lastScrollTopRef.current;
+            const isMovingUp =
+                previousScrollTop === null
+                    ? false
+                    : scroller.scrollTop < previousScrollTop - 2;
+            const nextIsNearTop = scroller.scrollTop <= TOP_PRELOAD_THRESHOLD_PX;
+            setIsNearTop(nextIsNearTop);
+            if (
+                nextIsNearTop &&
+                !wasNearTopRef.current &&
+                isMovingUp &&
+                historyHasMore &&
+                !historyLoadingMore
+            ) {
+                triggerLoadOlderTurns('auto');
+            }
+            wasNearTopRef.current = nextIsNearTop;
+            lastScrollTopRef.current = scroller.scrollTop;
+        };
+
+        updateNearTop();
+        scroller.addEventListener('scroll', updateNearTop, { passive: true });
+        return () => {
+            scroller.removeEventListener('scroll', updateNearTop);
+        };
+    }, [detail?.id, getScroller, historyHasMore, historyLoadingMore, triggerLoadOlderTurns]);
+
+    useEffect(() => {
+        if (!prependInFlightRef.current || !prependAnchorTurnIdRef.current) {
+            return;
+        }
+        if (historyLoadingMore) {
+            return;
+        }
+        const scroller = getScroller();
+        const previousMetrics = prependScrollMetricsRef.current;
+        if (scroller && previousMetrics) {
+            requestAnimationFrame(() => {
+                const heightDelta =
+                    scroller.scrollHeight - previousMetrics.scrollHeight;
+                scroller.scrollTop = previousMetrics.scrollTop + heightDelta;
+                lastScrollTopRef.current = scroller.scrollTop;
+                if (detail?.id) {
+                    savedScrollTopByThreadRef.current[detail.id] =
+                    scroller.scrollTop;
+                }
+                suppressAutoPreloadUntilRef.current =
+                    Date.now() + AUTO_PRELOAD_SUPPRESS_AFTER_RESTORE_MS;
+            });
+        } else {
+            const anchorId = prependAnchorTurnIdRef.current;
+            const anchorIndex = mixedData.findIndex(
+                (item) => item.kind === 'turn' && item.turn.id === anchorId,
             );
-            if (scroller) {
-                // Use a short timeout to let initial rendering settle
-                setTimeout(() => {
-                    scroller.scrollTo({
-                        top: scroller.scrollHeight,
+            if (anchorIndex >= 0) {
+                requestAnimationFrame(() => {
+                    virtuosoRef.current?.scrollToIndex({
+                        index: anchorIndex,
+                        align: 'start',
                         behavior: 'auto',
                     });
-                }, 50);
+                    suppressAutoPreloadUntilRef.current =
+                        Date.now() + AUTO_PRELOAD_SUPPRESS_AFTER_RESTORE_MS;
+                });
             }
         }
-    }, [detail?.id]);
+        prependInFlightRef.current = false;
+        prependAnchorTurnIdRef.current = null;
+        prependScrollMetricsRef.current = null;
+    }, [getScroller, historyLoadingMore, mixedData]);
+
+    useEffect(() => {
+        if (!detail?.id) {
+            initialAutoLoadDoneRef.current = false;
+            return;
+        }
+        if (
+            !initialAutoLoadDoneRef.current &&
+            historyHasMore &&
+            turns.length > 0 &&
+            turns.length < INITIAL_HISTORY_AUTOLOAD_TURN_COUNT
+        ) {
+            initialAutoLoadDoneRef.current = true;
+            triggerLoadOlderTurns('auto');
+            return;
+        }
+        if (!historyHasMore) {
+            initialAutoLoadDoneRef.current = true;
+        }
+    }, [detail?.id, historyHasMore, triggerLoadOlderTurns, turns.length]);
 
     return (
-        <section className="flex min-h-[440px] h-full flex-col bg-chat-bg relative overflow-hidden xl:h-full xl:min-h-0">
+        <section className="relative flex h-full min-h-[440px] flex-col overflow-hidden bg-[var(--chat-canvas)] font-['Segoe_UI','PingFang_SC','Microsoft_YaHei','Noto_Sans_SC',sans-serif] xl:min-h-0">
             <div className="flex-1 w-full h-full min-h-0 relative">
                 <Virtuoso
                     key={detail?.id || 'empty'}
                     ref={virtuosoRef}
                     atBottomStateChange={setAtBottom}
                     atBottomThreshold={100}
+                    startReached={() => {
+                        triggerLoadOlderTurns('auto');
+                    }}
                     className="h-full w-full custom-scroll"
                     data={mixedData}
                     computeItemKey={(index, item) => item.id}
@@ -948,8 +1472,8 @@ export function ChatView({
                     components={{
                         Header: () =>
                             shouldShowEmptyState ? (
-                                <div className="flex h-64 flex-col items-center justify-center text-center opacity-50 space-y-4 px-6 pt-6">
-                                    <div className="flex h-16 w-16 items-center justify-center rounded-3xl bg-accent/10 text-accent">
+                                <div className="flex h-64 flex-col items-center justify-center space-y-4 px-6 pt-8 text-center opacity-70">
+                                    <div className="flex h-16 w-16 items-center justify-center rounded-3xl bg-[color:color-mix(in_srgb,var(--chat-card)_92%,transparent)] text-accent shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
                                         <Sparkles size={32} />
                                     </div>
                                     <div>
@@ -962,7 +1486,28 @@ export function ChatView({
                                     </div>
                                 </div>
                             ) : (
-                                <div className="h-6" />
+                                <div className="mx-auto flex w-full max-w-[880px] justify-center px-6 pb-2 pt-4">
+                                    {historyLoadingMore ? (
+                                        <div className="rounded-full bg-[color:color-mix(in_srgb,var(--chat-card)_30%,transparent)] px-3 py-1.5 text-[11px] font-medium text-text-secondary">
+                                            {language === 'zh'
+                                                ? '正在加载更早消息...'
+                                                : 'Loading older messages...'}
+                                        </div>
+                                    ) : historyHasMore && isNearTop ? (
+                                        <button
+                                            type="button"
+                                            onClick={() => triggerLoadOlderTurns('manual')}
+                                            disabled={historyLoadingMore}
+                                            className="rounded-full bg-transparent px-3 py-1 text-[11px] font-medium text-text-secondary/80 transition-colors hover:bg-[color:color-mix(in_srgb,var(--chat-card)_22%,transparent)] hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            {language === 'zh'
+                                                ? '继续向上加载更早消息'
+                                                : 'Load older messages'}
+                                        </button>
+                                    ) : (
+                                        <div className="h-6" />
+                                    )}
+                                </div>
                             ),
                         Footer: () => <div className="h-6" />,
                     }}
@@ -973,18 +1518,24 @@ export function ChatView({
                                     <TurnItem
                                         turn={item.turn}
                                         isLatest={item.isLatest}
+                                        language={language}
                                     />
                                 </div>
                             );
                         }
                         if (item.kind === 'pending') {
                             return (
-                                <div className="px-6 mb-4">
-                                    <div className="w-full py-4 text-sm leading-relaxed text-text-primary text-left">
-                                        <div className="mb-3 flex items-center gap-2 text-[12px] uppercase tracking-wider text-text-secondary font-semibold">
-                                            <User size={14} /> YOU
+                                <div className="mx-auto flex w-full max-w-[880px] justify-end px-6 pb-6 pt-2">
+                                    <div className="max-w-[58%] rounded-[18px] bg-[color:color-mix(in_srgb,var(--chat-card-soft)_58%,transparent)] px-4 py-3 text-left shadow-[0_4px_12px_rgba(0,0,0,0.06)]">
+                                        <div className="mb-2 flex items-center justify-end gap-2 text-[11px] font-medium text-text-secondary">
+                                            <span>
+                                                {language === 'zh'
+                                                    ? '你'
+                                                    : 'You'}
+                                            </span>
+                                            <User size={13} />
                                         </div>
-                                        <pre className="whitespace-pre-wrap font-sans text-[15px] text-text-primary/90">
+                                        <pre className="whitespace-pre-wrap font-sans text-[14px] leading-6 text-text-primary">
                                             {item.prompt}
                                         </pre>
                                     </div>
@@ -993,14 +1544,14 @@ export function ChatView({
                         }
                         if (item.kind === 'thinking') {
                             return (
-                                <div className="px-6 mb-4">
+                                <div className="mx-auto w-full max-w-[880px] px-6 pb-6">
                                     <ThinkingCard language={language} />
                                 </div>
                             );
                         }
                         if (item.kind === 'liveDeltas') {
                             return (
-                                <div className="px-6 pb-2">
+                                <div className="mx-auto w-full max-w-[880px] px-6 pb-4">
                                     <motion.div
                                         initial={{ opacity: 0 }}
                                         animate={{ opacity: 1 }}
@@ -1010,9 +1561,9 @@ export function ChatView({
                                             {item.deltas.map(
                                                 ([itemId, delta]) => (
                                                     <div key={itemId}>
-                                                        <div className="flex items-center gap-1 mb-2 px-1">
+                                                        <div className="mb-3 flex items-center gap-1 px-1">
                                                             <span
-                                                                className="w-1.5 h-1.5 bg-accent rounded-full animate-bounce"
+                                                                className="h-1.5 w-1.5 rounded-full bg-accent animate-bounce"
                                                                 style={{
                                                                     animationDelay:
                                                                         '0ms',
@@ -1032,8 +1583,11 @@ export function ChatView({
                                                                         '300ms',
                                                                 }}
                                                             />
-                                                            <span className="ml-2 text-[10px] uppercase text-text-secondary">
-                                                                streaming
+                                                            <span className="ml-2 text-[10px] font-medium uppercase tracking-[0.12em] text-text-secondary">
+                                                                {language ===
+                                                                'zh'
+                                                                    ? '流式输出'
+                                                                    : 'Streaming'}
                                                             </span>
                                                         </div>
                                                         <LiveItemCard
@@ -1042,6 +1596,7 @@ export function ChatView({
                                                                 delta.stream
                                                             }
                                                             text={delta.text}
+                                                            language={language}
                                                         />
                                                     </div>
                                                 ),
@@ -1074,7 +1629,7 @@ export function ChatView({
                         }
                     }}
                     className={cn(
-                        'absolute bottom-6 right-6 z-20 rounded-full border border-white/10 bg-accent/80 p-2.5 text-white shadow-xl backdrop-blur-sm transition-all duration-150',
+                        'absolute bottom-8 right-8 z-20 rounded-full bg-[color:color-mix(in_srgb,var(--chat-card)_92%,transparent)] p-3 text-text-primary shadow-[0_8px_18px_rgba(0,0,0,0.12)] transition-all duration-150',
                         shouldShowScrollToLatestButton
                             ? 'pointer-events-auto opacity-100 scale-100'
                             : 'pointer-events-none opacity-0 scale-95',
@@ -1087,10 +1642,9 @@ export function ChatView({
                 </button>
             </div>
 
-            {/* Glow Input Area */}
-            <div className="p-6 bg-gradient-to-t from-chat-bg via-chat-bg to-transparent relative z-10 shrink-0">
+            <div className="relative z-10 shrink-0 bg-gradient-to-t from-[var(--chat-canvas)] via-[var(--chat-canvas)] to-transparent px-6 pb-6 pt-3">
                 <form
-                    className="w-full relative group flex flex-col items-center"
+                    className="group relative mx-auto flex w-full max-w-[880px] flex-col items-center"
                     onSubmit={async (e) => {
                         e.preventDefault();
                         if (await maybeHandleSlashCommand()) {
@@ -1099,18 +1653,21 @@ export function ChatView({
                         await handleSubmitPrompt();
                     }}
                 >
-                    {/* Glowing Backdrop */}
-                    <div className="absolute inset-0 bg-accent/20 blur-xl opacity-0 group-focus-within:opacity-100 transition-opacity rounded-2xl pointer-events-none" />
+                    <div className="pointer-events-none absolute inset-0 rounded-[30px] bg-accent/10 opacity-0 blur-2xl transition-opacity group-focus-within:opacity-100" />
 
-                    <div className="relative w-full flex flex-col bg-white/5 border border-border rounded-2xl p-2 focus-within:border-accent/50 transition-all shadow-lg">
+                    <div className="relative flex w-full flex-col overflow-hidden rounded-[30px] bg-[color:color-mix(in_srgb,var(--chat-card)_92%,transparent)] p-3 shadow-[0_10px_28px_rgba(0,0,0,0.12)] transition-all">
                         {hasSuggestions && (
-                            <div className="mx-2 mt-2 rounded-xl border border-border bg-sidebar/95 shadow-2xl overflow-hidden">
-                                <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-text-secondary border-b border-border/60">
+                            <div className="mx-2 mt-2 overflow-hidden rounded-2xl bg-[color:color-mix(in_srgb,var(--chat-card)_94%,transparent)] shadow-[0_10px_28px_rgba(0,0,0,0.14)]">
+                                <div className="border-b border-white/5 px-3 py-2 text-[10px] uppercase tracking-wider text-text-secondary">
                                     {activeToken?.trigger === '/'
-                                        ? '鍛戒护'
+                                        ? language === 'zh'
+                                            ? '命令'
+                                            : 'Commands'
                                         : activeToken?.trigger === '@'
-                                          ? '鏂囦欢'
-                                          : 'Skill'}
+                                          ? language === 'zh'
+                                              ? '文件'
+                                              : 'Files'
+                                          : 'Skills'}
                                 </div>
                                 <div className="max-h-64 overflow-y-auto py-1">
                                     {suggestions.map((suggestion, index) => (
@@ -1144,7 +1701,7 @@ export function ChatView({
                             ref={textareaRef}
                             id="chat-prompt"
                             name="chat-prompt"
-                            className="flex-1 bg-transparent border-none focus:ring-0 text-sm py-3 px-4 resize-none min-h-[56px] max-h-40 text-text-primary outline-none"
+                            className="min-h-[124px] max-h-52 flex-1 resize-none border-none bg-transparent px-4 py-4 text-[15px] leading-7 text-text-primary outline-none focus:ring-0"
                             placeholder={t.placeholder}
                             value={prompt}
                             onChange={(event) => {
@@ -1230,16 +1787,16 @@ export function ChatView({
                             }}
                         />
 
-                        <div className="flex justify-between items-center px-4 pt-2 pb-1 border-t border-white/5">
-                            <p className="text-[10px] text-text-secondary hidden sm:block">
+                        <div className="flex items-center justify-between border-t border-white/5 px-4 pb-2 pt-3">
+                            <p className="hidden text-[11px] text-text-secondary sm:block">
                                 {t.hint}
                             </p>
-                            <div className="flex gap-2 ml-auto">
+                            <div className="ml-auto flex items-center gap-2">
                                 {(turns.at(-1)?.status === 'inProgress' ||
                                     sending) && (
                                     <button
                                         type="button"
-                                        className="p-2 text-xs text-red-400 bg-red-400/10 rounded-xl hover:bg-red-400/20 transition-all"
+                                        className="rounded-full bg-red-500/10 px-3 py-2 text-xs text-red-500 transition-all hover:bg-red-500/15"
                                         onClick={onInterrupt}
                                     >
                                         {t.stop}
@@ -1252,7 +1809,7 @@ export function ChatView({
                                     }
                                     title={t.send}
                                     aria-label={t.send}
-                                    className="p-2.5 bg-accent text-white rounded-xl hover:bg-accent/80 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-md"
+                                    className="rounded-full bg-accent p-3 text-white shadow-sm transition-all hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
                                 >
                                     <Send size={16} />
                                 </button>

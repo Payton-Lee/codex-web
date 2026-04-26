@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
+import type * as Monaco from "monaco-editor";
 import { FileText, RefreshCw, Save } from "lucide-react";
 import { api } from "../api";
 import { cn } from "../lib/utils";
@@ -9,6 +10,7 @@ type FileEditorTabProps = {
   name: string;
   preview?: boolean;
   onPromote?(): void;
+  onDirtyChange?(dirty: boolean): void;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -66,6 +68,17 @@ function getFileExtension(pathValue: string): string {
 
 function inferLanguage(pathValue: string): string {
   const fileName = (pathValue.split(/[\\/]/).pop() ?? pathValue).toLowerCase();
+  if (
+    fileName === "tsconfig.json" ||
+    fileName.startsWith("tsconfig.") ||
+    fileName === "jsconfig.json" ||
+    fileName === ".eslintrc" ||
+    fileName === ".eslintrc.json" ||
+    fileName === ".swcrc" ||
+    fileName === "biome.json"
+  ) {
+    return "json";
+  }
   if (fileName === "dockerfile") {
     return "dockerfile";
   }
@@ -118,14 +131,77 @@ function inferLanguage(pathValue: string): string {
   return languages[extension] ?? "plaintext";
 }
 
-export function FileEditorTab({ path, name, preview = false, onPromote }: FileEditorTabProps) {
+const JSON_SCHEMA_CONFIG = [
+  {
+    uri: "https://json.schemastore.org/package",
+    fileMatch: ["package.json", "**/package.json"]
+  },
+  {
+    uri: "https://json.schemastore.org/tsconfig",
+    fileMatch: ["tsconfig.json", "**/tsconfig.json", "tsconfig.*.json", "**/tsconfig.*.json", "jsconfig.json", "**/jsconfig.json"]
+  },
+  {
+    uri: "https://json.schemastore.org/eslintrc",
+    fileMatch: [".eslintrc", "**/.eslintrc", ".eslintrc.json", "**/.eslintrc.json"]
+  }
+] as const;
+
+function configureMonaco(monaco: typeof Monaco): void {
+  const typescriptApi = monaco.languages.typescript as any;
+  const jsonApi = (monaco.languages as any).json;
+  typescriptApi.typescriptDefaults.setCompilerOptions({
+    allowJs: true,
+    allowNonTsExtensions: true,
+    jsx: typescriptApi.JsxEmit.Preserve,
+    target: typescriptApi.ScriptTarget.ESNext
+  });
+  typescriptApi.javascriptDefaults.setCompilerOptions({
+    allowJs: true,
+    allowNonTsExtensions: true,
+    jsx: typescriptApi.JsxEmit.Preserve,
+    target: typescriptApi.ScriptTarget.ESNext
+  });
+  jsonApi?.jsonDefaults?.setDiagnosticsOptions({
+    validate: true,
+    allowComments: true,
+    enableSchemaRequest: true,
+    schemaRequest: "warning",
+    schemaValidation: "warning",
+    schemas: JSON_SCHEMA_CONFIG.map((schema) => ({
+      uri: schema.uri,
+      fileMatch: schema.fileMatch
+    }))
+  });
+}
+
+export function FileEditorTab({ path, name, preview = false, onPromote, onDirtyChange }: FileEditorTabProps) {
   const [content, setContent] = useState("");
   const [metadata, setMetadata] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [externalChanged, setExternalChanged] = useState(false);
+  const [metadataVersion, setMetadataVersion] = useState("");
+  const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
+  const monacoRef = useRef<typeof Monaco | null>(null);
   const language = inferLanguage(path);
+
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const model = editor?.getModel();
+    if (!editor || !monaco || !model) {
+      return;
+    }
+    if (model.getLanguageId() !== language) {
+      monaco.editor.setModelLanguage(model, language);
+    }
+  }, [language, path]);
 
   const loadFile = async () => {
     setLoading(true);
@@ -138,8 +214,11 @@ export function FileEditorTab({ path, name, preview = false, onPromote }: FileEd
         }))
       ]);
       setContent(extractFileText(filePayload));
-      setMetadata(JSON.stringify(metadataPayload, null, 2));
+      const nextMetadata = JSON.stringify(metadataPayload, null, 2);
+      setMetadata(nextMetadata);
+      setMetadataVersion(nextMetadata);
       setDirty(false);
+      setExternalChanged(false);
     } catch (readError) {
       setError(readError instanceof Error ? readError.message : String(readError));
     } finally {
@@ -159,12 +238,35 @@ export function FileEditorTab({ path, name, preview = false, onPromote }: FileEd
     try {
       await api.fsWriteFile(path, textToBase64(content));
       setDirty(false);
+      await loadFile();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : String(saveError));
     } finally {
       setSaving(false);
     }
   };
+
+  useEffect(() => {
+    if (!path) {
+      return;
+    }
+    const handle = window.setInterval(() => {
+      if (loading || saving) {
+        return;
+      }
+      void api
+        .fsMetadata(path)
+        .then((payload) => {
+          const nextMetadata = JSON.stringify(payload, null, 2);
+          if (metadataVersion && nextMetadata !== metadataVersion) {
+            setMetadata(nextMetadata);
+            setExternalChanged(true);
+          }
+        })
+        .catch(() => undefined);
+    }, 4000);
+    return () => window.clearInterval(handle);
+  }, [loading, metadataVersion, path, saving]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-bg">
@@ -206,14 +308,29 @@ export function FileEditorTab({ path, name, preview = false, onPromote }: FileEd
         <div className="m-4 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200">{error}</div>
       ) : null}
 
+      {externalChanged ? (
+        <div className="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">
+          <span>File changed outside the editor. Reload to sync the latest content.</span>
+          <button
+            type="button"
+            onClick={() => void loadFile()}
+            className="shrink-0 rounded bg-white/10 px-3 py-1.5 text-xs font-medium hover:bg-white/15"
+          >
+            Reload latest
+          </button>
+        </div>
+      ) : null}
+
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_260px]">
         <div className="min-h-0 overflow-hidden bg-[#1e1e1e]">
           <Editor
             height="100%"
+            path={path}
             language={language}
             theme="vs-dark"
             value={content}
             loading={<div className="p-5 text-sm text-text-secondary">Loading editor...</div>}
+            beforeMount={configureMonaco}
             options={{
               automaticLayout: true,
               fontFamily: "JetBrains Mono, Fira Code, Consolas, monospace",
@@ -233,7 +350,16 @@ export function FileEditorTab({ path, name, preview = false, onPromote }: FileEd
               setContent(value ?? "");
               setDirty(true);
             }}
-            onMount={(editor) => {
+            onMount={(editor, monaco) => {
+              editorRef.current = editor;
+              monacoRef.current = monaco;
+              const model = editor.getModel();
+              if (model && model.getLanguageId() !== language) {
+                monaco.editor.setModelLanguage(model, language);
+              }
+              editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+                void saveFile();
+              });
               editor.focus();
             }}
           />

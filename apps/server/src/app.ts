@@ -17,6 +17,7 @@ import {
   SettingsSummary,
   SnapshotPayload,
   ThreadDetail,
+  ThreadHistoryPage,
   ThreadItem,
   ThreadStatus,
   ThreadSummary
@@ -30,6 +31,7 @@ import { openFolderDialog } from "./open-folder-dialog.js";
 import { buildDiffPreview } from "./diff-preview.js";
 import { searchSkills, searchWorkspaceFiles } from "./composer.js";
 import { SessionStore } from "./session-store.js";
+import { CodexThreadStore } from "./codex-thread-store.js";
 
 type JsonRpcServerRequest = {
   id: string | number;
@@ -69,6 +71,24 @@ function normalizeThreadStatus(
       return candidate;
     default:
       return fallback;
+  }
+}
+
+async function withRejectTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -433,7 +453,8 @@ export function createApp() {
     appConfig.defaultWorkspace,
     appConfig.workspaceDbPath
   );
-  const sessionStore = new SessionStore(appConfig.workspaceDbPath);
+const sessionStore = new SessionStore(appConfig.workspaceDbPath);
+const codexThreadStore = new CodexThreadStore(appConfig.workspaceDbPath, appConfig.codexHomeDir);
   const { env, retainedEnvKeys, strippedCodexEnvKeys, droppedParentEnvKeys } = buildAppServerEnv();
   const codexBinaryVersion = detectCodexBinaryVersion(appConfig.codexCommand, env, logger);
   logger.log("app_server.env.prepared", {
@@ -537,10 +558,19 @@ export function createApp() {
   }
 
   async function refreshAccount(): Promise<AccountSummary> {
-    const response = (await client.request<any>("account/read", { refreshToken: false })) ?? {};
-    const rateLimitsResponse = await client.request<any>("account/rateLimits/read", undefined).catch(
-      () => null
-    );
+    const response = await withTimeout(
+      client.request<any>("account/read", { refreshToken: false }),
+      1500,
+      null
+    ).catch(() => null);
+    if (!response) {
+      return account;
+    }
+    const rateLimitsResponse = await withTimeout(
+      client.request<any>("account/rateLimits/read", undefined),
+      1200,
+      null
+    ).catch(() => null);
     const nextAccount: AccountSummary = {
       loggedIn: Boolean(response.account),
       mode: response.account?.type ?? "unknown",
@@ -556,45 +586,40 @@ export function createApp() {
   }
 
   async function refreshThreads(): Promise<ThreadSummary[]> {
-    const response = await client.request<any>("thread/list", {
-      limit: 100,
-      sortKey: "updated_at",
-      archived: false,
-      sourceKinds: [...ALL_THREAD_SOURCE_KINDS]
-    });
-    const latestThreads = new Map<string, ThreadSummary>();
-    for (const thread of response.data ?? []) {
-      latestThreads.set(thread.id, toThreadSummary(thread, turnStatusByThread.get(thread.id) ?? "idle"));
+    let orderedThreads: ThreadSummary[];
+    try {
+      orderedThreads = codexThreadStore.listThreads(turnStatusByThread, 200);
+    } catch (error) {
+      logger.log("threads.refresh.index_failed", {
+        message: error instanceof Error ? error.message : String(error)
+      });
+      orderedThreads = [...threads.values()].sort((a, b) => b.updatedAt - a.updatedAt);
     }
-    const loaded = await client.request<any>("thread/loaded/list", {
-      limit: 100
-    }).catch(() => null);
-    for (const threadId of loaded?.data ?? []) {
-      if (latestThreads.has(threadId)) {
-        continue;
-      }
-      const detail = await client
-        .request<any>("thread/read", {
-          threadId,
-          includeTurns: false
-        })
-        .catch(() => null);
-      if (detail?.thread) {
-        latestThreads.set(
-          detail.thread.id,
-          toThreadSummary(detail.thread, turnStatusByThread.get(detail.thread.id) ?? "idle")
-        );
-      }
+
+    let nextLoadedThreadIds = loadedThreads.loadedThreadIds;
+    try {
+      const loaded = await withRejectTimeout(
+        client.request<any>("thread/loaded/list", {
+          limit: 100
+        }),
+        1200,
+        "thread/loaded/list"
+      );
+      nextLoadedThreadIds = [...(loaded?.data ?? [])];
+    } catch (error) {
+      logger.log("threads.refresh.loaded_failed", {
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
+
     threads.clear();
-    for (const [threadId, thread] of latestThreads.entries()) {
-      threads.set(threadId, thread);
+    for (const thread of orderedThreads) {
+      threads.set(thread.id, thread);
     }
     loadedThreads = {
-      loadedThreadIds: [...(loaded?.data ?? [])],
+      loadedThreadIds: nextLoadedThreadIds,
       refreshedAt: Date.now()
     };
-    const orderedThreads = Array.from(latestThreads.values()).sort((a, b) => b.updatedAt - a.updatedAt);
     sessionStore.syncThreads(orderedThreads);
     return orderedThreads;
   }
@@ -646,11 +671,11 @@ export function createApp() {
   async function refreshAppServerCatalog(): Promise<AppServerCatalog> {
     const [skillsResponse, pluginsResponse, modelsResponse, collaborationModesResponse, experimentalFeaturesResponse] =
       await Promise.all([
-        client.request<any>("skills/list", {}),
-        client.request<any>("plugin/list", {}),
-        client.request<any>("model/list", {}),
-        client.request<any>("collaborationMode/list", {}),
-        client.request<any>("experimentalFeature/list", {})
+        withTimeout(client.request<any>("skills/list", {}), 1500, null),
+        withTimeout(client.request<any>("plugin/list", {}), 1500, null),
+        withTimeout(client.request<any>("model/list", {}), 1500, null),
+        withTimeout(client.request<any>("collaborationMode/list", {}), 1500, null),
+        withTimeout(client.request<any>("experimentalFeature/list", {}), 1500, null)
       ]);
 
     const skills = (skillsResponse?.data ?? []).flatMap((entry: any) =>
@@ -986,6 +1011,23 @@ export function createApp() {
           itemId: params.itemId,
           stream: "fileChange",
           delta: params.delta
+        }
+      });
+      return;
+    }
+
+    if (method === "command/exec/outputDelta") {
+      const processId = String(params.processId ?? "").trim();
+      if (!processId) {
+        return;
+      }
+      broadcast({
+        type: "command.exec.delta",
+        payload: {
+          processId,
+          stream: params.stream === "stderr" ? "stderr" : "stdout",
+          deltaBase64: String(params.deltaBase64 ?? ""),
+          capReached: Boolean(params.capReached)
         }
       });
       return;
@@ -1344,7 +1386,6 @@ export function createApp() {
     if (!requireOrigin(req, res)) {
       return;
     }
-    await ensureClientReady();
     res.json(await refreshThreads());
   });
 
@@ -1352,7 +1393,6 @@ export function createApp() {
     if (!requireOrigin(req, res)) {
       return;
     }
-    await ensureClientReady();
     await refreshThreads();
     res.json(loadedThreads);
   });
@@ -1649,9 +1689,9 @@ export function createApp() {
       return;
     }
     await ensureClientReady();
-    const processId = Number(req.params.processId);
-    if (!Number.isFinite(processId)) {
-      res.status(400).json({ error: "processId must be a number" });
+    const processId = String(req.params.processId ?? "").trim();
+    if (!processId) {
+      res.status(400).json({ error: "processId is required" });
       return;
     }
     logger.log("command.exec.write.requested", { processId });
@@ -1670,9 +1710,9 @@ export function createApp() {
       return;
     }
     await ensureClientReady();
-    const processId = Number(req.params.processId);
-    if (!Number.isFinite(processId)) {
-      res.status(400).json({ error: "processId must be a number" });
+    const processId = String(req.params.processId ?? "").trim();
+    if (!processId) {
+      res.status(400).json({ error: "processId is required" });
       return;
     }
     logger.log("command.exec.resize.requested", { processId });
@@ -1691,9 +1731,9 @@ export function createApp() {
       return;
     }
     await ensureClientReady();
-    const processId = Number(req.params.processId);
-    if (!Number.isFinite(processId)) {
-      res.status(400).json({ error: "processId must be a number" });
+    const processId = String(req.params.processId ?? "").trim();
+    if (!processId) {
+      res.status(400).json({ error: "processId is required" });
       return;
     }
     logger.log("command.exec.terminate.requested", { processId });
@@ -1938,13 +1978,19 @@ export function createApp() {
     if (!requireOrigin(req, res)) {
       return;
     }
+    const fallbackStatus = turnStatusByThread.get(req.params.threadId) ?? "idle";
+    const detail = codexThreadStore.readThreadDetail(req.params.threadId, fallbackStatus);
+    if (detail) {
+      res.json(detail);
+      return;
+    }
     await ensureClientReady();
     try {
       const response = await client.request<any>("thread/read", {
         threadId: req.params.threadId,
         includeTurns: true
       });
-      res.json(toThreadDetail(response.thread, turnStatusByThread.get(req.params.threadId) ?? "idle"));
+      res.json(toThreadDetail(response.thread, fallbackStatus));
     } catch (error) {
       if (!isThreadNotMaterializedError(error)) {
         throw error;
@@ -1954,10 +2000,27 @@ export function createApp() {
         includeTurns: false
       });
       res.json({
-        ...toThreadSummary(response.thread, turnStatusByThread.get(req.params.threadId) ?? "idle"),
+        ...toThreadSummary(response.thread, fallbackStatus),
         turns: []
       } satisfies ThreadDetail);
     }
+  });
+
+  app.get("/api/threads/:threadId/history", async (req, res) => {
+    if (!requireOrigin(req, res)) {
+      return;
+    }
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 20) || 20));
+    const beforeTurnId = String(req.query.beforeTurnId ?? "").trim() || null;
+    const page = codexThreadStore.readThreadHistoryPage(req.params.threadId, {
+      beforeTurnId,
+      limit
+    });
+    if (page) {
+      res.json(page satisfies ThreadHistoryPage);
+      return;
+    }
+    res.status(404).json({ error: `thread not found: ${req.params.threadId}` });
   });
 
   app.post("/api/threads/:threadId/turns", async (req, res) => {

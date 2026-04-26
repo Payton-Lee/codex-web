@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -7,9 +7,11 @@ import {
   Folder,
   FolderPlus,
   Info,
+  Pencil,
   Plus,
   RefreshCw,
   Trash2,
+  Forward,
   Eye,
   EyeOff
 } from "lucide-react";
@@ -28,7 +30,14 @@ type FileEntry = {
 type FilesPanelProps = {
   rootPath: string | null;
   onOpenFile?(file: { path: string; name: string }, mode?: "preview" | "pinned"): void;
+  onRelocateFile?(oldPath: string, nextPath: string, nextName: string): void;
 };
+
+type ContextMenuState = {
+  x: number;
+  y: number;
+  entry: FileEntry;
+} | null;
 
 const DIRECTORY_KEYS = ["entries", "items", "files", "children", "directories"];
 
@@ -154,7 +163,7 @@ function toMetadataText(metadata: unknown): string {
   return JSON.stringify(metadata, null, 2);
 }
 
-export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
+export function FilesPanel({ rootPath, onOpenFile, onRelocateFile }: FilesPanelProps) {
   const [childrenByPath, setChildrenByPath] = useState<Record<string, FileEntry[]>>({});
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [selectedEntry, setSelectedEntry] = useState<FileEntry | null>(null);
@@ -163,6 +172,7 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
   const [metadataText, setMetadataText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [watchId, setWatchId] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const watchIdRef = useRef<string | null>(null);
 
   const rootEntry = useMemo<FileEntry | null>(
@@ -189,6 +199,7 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
     setMetadataText("");
     setError(null);
     setWatchId(null);
+    setContextMenu(null);
   }, [rootPath]);
 
   const loadDirectory = async (pathValue: string) => {
@@ -226,6 +237,20 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
     if (pathValue) {
       await loadDirectory(pathValue);
     }
+  };
+
+  const moveEntry = async (entry: FileEntry, destinationPath: string, nextName = getPathName(destinationPath)) => {
+    await api.fsCopy(entry.path, destinationPath, entry.isDirectory);
+    await api.fsRemove(entry.path, entry.isDirectory, true);
+    if (selectedEntry?.path === entry.path) {
+      setSelectedEntry({
+        ...entry,
+        name: nextName,
+        path: destinationPath
+      });
+    }
+    onRelocateFile?.(entry.path, destinationPath, nextName);
+    await refreshDirectory();
   };
 
   const toggleDirectory = async (entry: FileEntry) => {
@@ -298,17 +323,51 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
     }
   };
 
-  const deleteSelected = async () => {
-    if (!selectedEntry) {
+  const renameSelected = async (entry = selectedEntry) => {
+    if (!entry) {
       return;
     }
-    const ok = window.confirm(`Delete ${selectedEntry.name}?`);
+    const nextName = window.prompt("Rename to", entry.name);
+    if (!nextName?.trim() || nextName.trim() === entry.name) {
+      return;
+    }
+    const parentPath = entry.path.slice(0, Math.max(entry.path.lastIndexOf("\\"), entry.path.lastIndexOf("/")));
+    const nextPath = joinPath(parentPath, nextName.trim());
+    setError(null);
+    try {
+      await moveEntry(entry, nextPath, nextName.trim());
+    } catch (renameError) {
+      setError(renameError instanceof Error ? renameError.message : String(renameError));
+    }
+  };
+
+  const moveSelected = async (entry = selectedEntry) => {
+    if (!entry) {
+      return;
+    }
+    const destination = window.prompt("Move to path", entry.path);
+    if (!destination?.trim() || destination.trim() === entry.path) {
+      return;
+    }
+    setError(null);
+    try {
+      await moveEntry(entry, destination.trim());
+    } catch (moveError) {
+      setError(moveError instanceof Error ? moveError.message : String(moveError));
+    }
+  };
+
+  const deleteSelected = async (entry = selectedEntry) => {
+    if (!entry) {
+      return;
+    }
+    const ok = window.confirm(`Delete ${entry.name}?`);
     if (!ok) {
       return;
     }
     setError(null);
     try {
-      await api.fsRemove(selectedEntry.path, selectedEntry.isDirectory, true);
+      await api.fsRemove(entry.path, entry.isDirectory, true);
       setSelectedEntry(null);
       setMetadataText("");
       await refreshDirectory();
@@ -317,17 +376,17 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
     }
   };
 
-  const copySelected = async () => {
-    if (!selectedEntry) {
+  const copySelected = async (entry = selectedEntry) => {
+    if (!entry) {
       return;
     }
-    const destination = window.prompt("Copy destination path", `${selectedEntry.path}.copy`);
+    const destination = window.prompt("Copy destination path", `${entry.path}.copy`);
     if (!destination?.trim()) {
       return;
     }
     setError(null);
     try {
-      await api.fsCopy(selectedEntry.path, destination.trim(), selectedEntry.isDirectory);
+      await api.fsCopy(entry.path, destination.trim(), entry.isDirectory);
       await refreshDirectory();
     } catch (copyError) {
       setError(copyError instanceof Error ? copyError.message : String(copyError));
@@ -379,6 +438,52 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
     []
   );
 
+  useEffect(() => {
+    if (!watchId || !activeDirectory) {
+      return;
+    }
+    const handle = window.setInterval(() => {
+      void api
+        .fsReadDirectory(activeDirectory)
+        .then((payload) => {
+          const nextEntries = normalizeEntries(payload, activeDirectory);
+          const nextSignature = JSON.stringify(nextEntries.map((entry) => `${entry.path}:${entry.modifiedAt ?? ""}:${entry.size ?? ""}`));
+          const currentEntries = childrenByPath[activeDirectory] ?? [];
+          const currentSignature = JSON.stringify(currentEntries.map((entry) => `${entry.path}:${entry.modifiedAt ?? ""}:${entry.size ?? ""}`));
+          if (nextSignature !== currentSignature) {
+            setChildrenByPath((children) => ({
+              ...children,
+              [activeDirectory]: nextEntries
+            }));
+          }
+        })
+        .catch(() => undefined);
+    }, 4000);
+    return () => window.clearInterval(handle);
+  }, [activeDirectory, childrenByPath, watchId]);
+
+  useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+    const close = () => setContextMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [contextMenu]);
+
+  const openContextMenu = (event: ReactMouseEvent, entry: FileEntry) => {
+    event.preventDefault();
+    setSelectedEntry(entry);
+    if (entry.isDirectory) {
+      setActiveDirectory(entry.path);
+    }
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      entry
+    });
+  };
+
   const renderTreeNode = (entry: FileEntry, depth: number) => {
     const expanded = expandedPaths.has(entry.path);
     const children = childrenByPath[entry.path] ?? [];
@@ -391,6 +496,7 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
           role="button"
           tabIndex={0}
           onClick={() => (entry.isDirectory ? void toggleDirectory(entry) : void openFile(entry, "preview"))}
+          onContextMenu={(event) => openContextMenu(event, entry)}
           onDoubleClick={() => {
             if (!entry.isDirectory) {
               void openFile(entry, "pinned");
@@ -539,6 +645,22 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
             <div className="flex shrink-0 gap-1">
               <button
                 type="button"
+                onClick={() => void renameSelected()}
+                className="rounded border border-border/60 p-1 text-text-secondary hover:text-text-primary"
+                title="Rename"
+              >
+                <Pencil size={13} />
+              </button>
+              <button
+                type="button"
+                onClick={() => void moveSelected()}
+                className="rounded border border-border/60 p-1 text-text-secondary hover:text-text-primary"
+                title="Move"
+              >
+                <Forward size={13} />
+              </button>
+              <button
+                type="button"
                 onClick={refreshMetadata}
                 className="rounded border border-border/60 p-1 text-text-secondary hover:text-text-primary"
                 title="Metadata"
@@ -547,7 +669,7 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
               </button>
               <button
                 type="button"
-                onClick={copySelected}
+                onClick={() => void copySelected()}
                 className="rounded border border-border/60 p-1 text-text-secondary hover:text-text-primary"
                 title="Copy"
               >
@@ -555,7 +677,7 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
               </button>
               <button
                 type="button"
-                onClick={deleteSelected}
+                onClick={() => void deleteSelected()}
                 className="rounded border border-border/60 p-1 text-red-300 hover:border-red-400/50"
                 title="Delete"
               >
@@ -571,6 +693,97 @@ export function FilesPanel({ rootPath, onOpenFile }: FilesPanelProps) {
           )}
         </div>
       )}
+
+      {contextMenu ? (
+        <div
+          className="fixed z-50 min-w-[180px] rounded-xl border border-border bg-panel-bg p-1 shadow-2xl"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {!contextMenu.entry.isDirectory ? (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  void openFile(contextMenu.entry, "preview");
+                  setContextMenu(null);
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-white/5"
+              >
+                <FileText size={13} />
+                Open Preview
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void openFile(contextMenu.entry, "pinned");
+                  setContextMenu(null);
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-white/5"
+              >
+                <FileText size={13} />
+                Open Pinned
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                void toggleDirectory(contextMenu.entry);
+                setContextMenu(null);
+              }}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-white/5"
+            >
+              <Folder size={13} />
+              {expandedPaths.has(contextMenu.entry.path) ? "Collapse" : "Expand"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              void renameSelected(contextMenu.entry);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-white/5"
+          >
+            <Pencil size={13} />
+            Rename
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void moveSelected(contextMenu.entry);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-white/5"
+          >
+            <Forward size={13} />
+            Move
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void copySelected(contextMenu.entry);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-white/5"
+          >
+            <Copy size={13} />
+            Copy
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void deleteSelected(contextMenu.entry);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-red-300 hover:bg-red-500/10"
+          >
+            <Trash2 size={13} />
+            Delete
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -12,6 +12,7 @@ import {
   PanelRightOpen,
   Settings,
   Sun,
+  Terminal,
   User,
   X
 } from "lucide-react";
@@ -22,6 +23,7 @@ import { DiffViewer } from "./components/DiffViewer";
 import { FileEditorTab } from "./components/FileEditorTab";
 import { FilesPanel } from "./components/FilesPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { TerminalTab } from "./components/TerminalTab";
 import { ThreadSidebar } from "./components/ThreadSidebar";
 import { WorkspaceSelector } from "./components/WorkspaceSelector";
 import { useAppStore } from "./store";
@@ -35,9 +37,11 @@ type ThemeMode = "dark" | "light";
 type LanguageMode = "zh" | "en";
 type SettingsSection = "overview" | "skills" | "plugins" | "models" | "modes" | "experimental";
 type FileOpenMode = "preview" | "pinned";
-type CenterTab =
+type FileCenterTab =
   | { id: "chat"; type: "chat"; title: string }
-  | { id: string; type: "file"; title: string; path: string; pinned: boolean };
+  | { id: string; type: "file"; title: string; path: string; pinned: boolean; dirty: boolean };
+type TerminalCenterTab = { id: string; type: "terminal"; title: string; cwd?: string | null };
+type CenterTab = FileCenterTab | TerminalCenterTab;
 
 export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>("diff");
@@ -65,6 +69,8 @@ export default function App() {
     selectedThreadId,
     threadDetail,
     threadDetailRefreshing,
+    threadHistoryHasMore,
+    threadHistoryLoadingMore,
     liveDeltas,
     pendingPrompt,
     bootstrap,
@@ -81,6 +87,7 @@ export default function App() {
     readFsMetadataDebug,
     sendPrompt,
     interruptTurn,
+    loadOlderTurns,
     pickWorkspace,
     selectWorkspace,
     renameThread,
@@ -260,6 +267,7 @@ export default function App() {
       return;
     }
     if (command === "runtime") {
+      openTerminalTab();
       return;
     }
   };
@@ -329,7 +337,8 @@ export default function App() {
           type: "file" as const,
           title: file.name,
           path: file.path,
-          pinned: false
+          pinned: false,
+          dirty: false
         };
         return tabs.some((tab) => tab.id === "file-preview")
           ? tabs.map((tab) => (tab.id === "file-preview" ? previewTab : tab))
@@ -342,11 +351,25 @@ export default function App() {
           type: "file",
           title: file.name,
           path: file.path,
-          pinned: true
+          pinned: true,
+          dirty: false
         }
       ];
     });
     setActiveCenterTabId(nextActiveTabId);
+  };
+  const openTerminalTab = () => {
+    const tabId = `terminal:${Date.now()}`;
+    setCenterTabs((tabs) => [
+      ...tabs,
+      {
+        id: tabId,
+        type: "terminal",
+        title: "Terminal",
+        cwd: currentWorkspace ?? threadDetail?.cwd ?? null
+      }
+    ]);
+    setActiveCenterTabId(tabId);
   };
   const promoteFileTab = (path: string) => {
     const pinnedTabId = `file:${path}`;
@@ -366,9 +389,46 @@ export default function App() {
     });
     setActiveCenterTabId(pinnedTabId);
   };
+  const updateFileTabDirty = (path: string, dirty: boolean) => {
+    setCenterTabs((tabs) =>
+      tabs.map((tab) => (tab.type === "file" && tab.path === path ? { ...tab, dirty } : tab))
+    );
+  };
+  const relocateFileTab = (oldPath: string, nextPath: string, nextTitle: string) => {
+    const nextId = `file:${nextPath}`;
+    setCenterTabs((tabs) =>
+      tabs.map((tab) => {
+        if (tab.type !== "file" || tab.path !== oldPath) {
+          return tab;
+        }
+        return {
+          ...tab,
+          id: tab.pinned ? nextId : tab.id,
+          path: nextPath,
+          title: nextTitle
+        };
+      })
+    );
+    if (activeCenterTab?.type === "file" && activeCenterTab.path === oldPath) {
+      setActiveCenterTabId(activeCenterTab.pinned ? nextId : activeCenterTab.id);
+    }
+  };
   const closeCenterTab = (tabId: string) => {
     if (tabId === "chat") {
       return;
+    }
+    const tabToClose = centerTabs.find((tab) => tab.id === tabId);
+    if (tabToClose?.type === "file" && tabToClose.dirty) {
+      const confirmed = window.confirm(`Close ${tabToClose.title} without saving?`);
+      if (!confirmed) {
+        return;
+      }
+    }
+    if (tabToClose?.type === "terminal") {
+      const confirmed = window.confirm(`Close ${tabToClose.title}?`);
+      if (!confirmed) {
+        return;
+      }
     }
     setCenterTabs((tabs) => {
       const nextTabs = tabs.filter((tab) => tab.id !== tabId);
@@ -458,7 +518,7 @@ export default function App() {
                 <div className="flex-1 overflow-y-auto w-full no-scrollbar pb-6 p-4">
               
               {leftTab === "files" && (
-                <FilesPanel rootPath={currentWorkspace} onOpenFile={openFileTab} />
+                <FilesPanel rootPath={currentWorkspace} onOpenFile={openFileTab} onRelocateFile={relocateFileTab} />
               )}
 
               {leftTab === "threads" && (
@@ -628,7 +688,7 @@ export default function App() {
                     tabIndex={0}
                     onClick={() => setActiveCenterTabId(tab.id)}
                     onAuxClick={(event) => {
-                      if (event.button === 1 && tab.type === "file") {
+                      if (event.button === 1 && tab.type !== "chat") {
                         event.preventDefault();
                         closeCenterTab(tab.id);
                       }
@@ -645,13 +705,14 @@ export default function App() {
                         ? "border-border bg-bg text-text-primary"
                         : "text-text-secondary hover:bg-white/5 hover:text-text-primary"
                     )}
-                    title={tab.type === "file" ? tab.path : tab.title}
+                    title={tab.type === "file" ? tab.path : tab.type === "terminal" ? tab.cwd ?? tab.title : tab.title}
                   >
-                    {tab.type === "chat" ? <MessageSquare size={14} /> : <FileText size={14} />}
+                    {tab.type === "chat" ? <MessageSquare size={14} /> : tab.type === "terminal" ? <Terminal size={14} /> : <FileText size={14} />}
                     <span className={cn("truncate", tab.type === "file" && !tab.pinned && "italic")}>
                       {tab.title}
                     </span>
-                    {tab.type === "file" ? (
+                    {tab.type === "file" && tab.dirty ? <span className="text-accent">•</span> : null}
+                    {tab.type !== "chat" ? (
                       <button
                         type="button"
                         onClick={(event) => {
@@ -666,6 +727,15 @@ export default function App() {
                     ) : null}
                   </div>
                 ))}
+                <button
+                  type="button"
+                  onClick={openTerminalTab}
+                  className="mb-1 flex shrink-0 items-center gap-2 rounded-t-lg border border-transparent px-3 py-1.5 text-xs text-text-secondary hover:bg-white/5 hover:text-text-primary"
+                  title="New terminal"
+                >
+                  <Terminal size={14} />
+                  <span>+</span>
+                </button>
               </div>
               <div className="min-h-0 flex-1">
                 {activeCenterTab?.type === "file" ? (
@@ -675,7 +745,10 @@ export default function App() {
                     name={activeCenterTab.title}
                     preview={!activeCenterTab.pinned}
                     onPromote={() => promoteFileTab(activeCenterTab.path)}
+                    onDirtyChange={(dirty) => updateFileTabDirty(activeCenterTab.path, dirty)}
                   />
+                ) : activeCenterTab?.type === "terminal" ? (
+                  <TerminalTab cwd={activeCenterTab.cwd ?? currentWorkspace ?? threadDetail?.cwd ?? null} />
                 ) : (
                   <ChatView
                     detail={threadDetail}
@@ -686,6 +759,11 @@ export default function App() {
                         : null
                     }
                     detailRefreshing={threadDetailRefreshing}
+                    historyHasMore={threadHistoryHasMore}
+                    historyLoadingMore={threadHistoryLoadingMore}
+                    onLoadOlderTurns={() => {
+                      void loadOlderTurns();
+                    }}
                     onSend={sendPrompt}
                     onInterrupt={() => {
                       void interruptTurn();

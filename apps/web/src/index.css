@@ -3,9 +3,15 @@
 @tailwind utilities;
 
 :root {
+  --font-sans: "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: "Cascadia Mono", "JetBrains Mono", "SFMono-Regular", "Consolas", monospace;
   --sidebar-bg: #1e1e1e;
   --chat-bg: #0b0b0b;
   --panel-bg: #252526;
+  --chat-canvas: #111315;
+  --chat-card: #15181b;
+  --chat-card-soft: #1a1e23;
+  --chat-card-muted: #121519;
   --border-color: rgba(255, 255, 255, 0.1);
   --text-primary: #f3f4f6;
   --text-secondary: #9ca3af;
@@ -21,15 +27,49 @@
   --text-primary: #1f2937;
   --text-secondary: #4b5563;
   --panel-bg: #ffffff;
+  --chat-canvas: #f7f6f3;
+  --chat-card: #ffffff;
+  --chat-card-soft: #f2f1ed;
+  --chat-card-muted: #f5f4f1;
   --accent: #2563eb;
   --accent-soft: rgba(37, 99, 235, 0.12);
+}
+
+.theme-dark {
+  --sidebar-bg: #1e1e1e;
+  --chat-bg: #0b0b0b;
+  --panel-bg: #252526;
+  --chat-canvas: #111315;
+  --chat-card: #15181b;
+  --chat-card-soft: #1a1e23;
+  --chat-card-muted: #121519;
+  --border-color: rgba(255, 255, 255, 0.1);
+  --text-primary: #f3f4f6;
+  --text-secondary: #9ca3af;
+  --accent: #3b82f6;
+  --accent-soft: rgba(59, 130, 246, 0.16);
 }
 
 @layer base {
   html, body {
     margin: 0;
     height: 100%;
+    font-family: var(--font-sans);
     @apply bg-chat-bg text-text-primary antialiased;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  code,
+  pre,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
   }
 
   #root {

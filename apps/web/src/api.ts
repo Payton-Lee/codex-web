@@ -11,6 +11,7 @@ import type {
   SettingsSummary,
   SnapshotPayload,
   ThreadDetail,
+  ThreadHistoryPage,
   ThreadSummary,
   WorkspaceFileSuggestion,
   WorkspaceState
@@ -117,6 +118,22 @@ export const api = {
     request<ThreadDetail>(`/api/threads/${threadId}`, {
       cache: "no-store"
     }),
+  threadHistory: (threadId: string, options?: { beforeTurnId?: string | null; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (options?.beforeTurnId) {
+      params.set("beforeTurnId", options.beforeTurnId);
+    }
+    if (typeof options?.limit === "number") {
+      params.set("limit", String(options.limit));
+    }
+    const query = params.toString();
+    return request<ThreadHistoryPage>(
+      `/api/threads/${threadId}/history${query ? `?${query}` : ""}`,
+      {
+        cache: "no-store"
+      }
+    );
+  },
   searchComposerFiles: (query: string) =>
     request<WorkspaceFileSuggestion[]>(`/api/composer/files?query=${encodeURIComponent(query)}`),
   searchComposerSkills: (query: string) =>
@@ -141,6 +158,33 @@ export const api = {
         command,
         ...(cwd ? { cwd } : {})
       })
+    }),
+  execCommandInteractive: (payload: {
+    command: string[];
+    cwd?: string | null;
+    processId: string;
+    tty?: boolean;
+    size?: { cols: number; rows: number };
+    env?: Record<string, string>;
+    disableTimeout?: boolean;
+  }) =>
+    request<unknown>("/api/commands/exec", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  execCommandWrite: (processId: string, input: string) =>
+    request<unknown>(`/api/commands/exec/${encodeURIComponent(processId)}/write`, {
+      method: "POST",
+      body: JSON.stringify({ input })
+    }),
+  execCommandResize: (processId: string, cols: number, rows: number) =>
+    request<unknown>(`/api/commands/exec/${encodeURIComponent(processId)}/resize`, {
+      method: "POST",
+      body: JSON.stringify({ size: { cols, rows } })
+    }),
+  execCommandTerminate: (processId: string) =>
+    request<unknown>(`/api/commands/exec/${encodeURIComponent(processId)}/terminate`, {
+      method: "POST"
     }),
   fsReadFile: (path: string) =>
     request<unknown>("/api/fs/read-file", {

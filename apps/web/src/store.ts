@@ -7,6 +7,7 @@ import type {
   SettingsSummary,
   SnapshotPayload,
   ThreadDetail,
+  TurnSummary,
   ThreadItem,
   ThreadSummary
 } from "./shared";
@@ -22,6 +23,7 @@ type LiveItemState = {
 };
 type DeltaMap = Record<string, LiveItemState>;
 type PendingPrompt = { threadId: string; prompt: string } | null;
+const THREAD_HISTORY_PAGE_SIZE = 20;
 const SESSION_QUERY_KEY = "sid";
 let threadDetailRequestSeq = 0;
 const latestThreadDetailRequestByThread = new Map<string, number>();
@@ -100,6 +102,15 @@ function detailContainsPrompt(detail: ThreadDetail, prompt: string): boolean {
   );
 }
 
+function normalizeHistoryTurns(turns: TurnSummary[]): TurnSummary[] {
+  return [...turns].reverse();
+}
+
+function mergeThreadTurns(existing: TurnSummary[], incoming: TurnSummary[]): TurnSummary[] {
+  const olderTurns = existing.filter((turn) => !incoming.some((candidate) => candidate.id === turn.id));
+  return [...olderTurns, ...incoming];
+}
+
 function normalizeLoginErrorMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
   if (raw.includes("LOGIN_SERVER_PORT_BLOCKED") || raw.includes("localhost:1455")) {
@@ -130,6 +141,9 @@ interface AppState {
   selectedThreadId: string | null;
   threadDetail: ThreadDetail | null;
   threadDetailRefreshing: boolean;
+  threadHistoryHasMore: boolean;
+  threadHistoryNextBeforeTurnId: string | null;
+  threadHistoryLoadingMore: boolean;
   liveDeltas: DeltaMap;
   activeTurnId: string | null;
   pendingPrompt: PendingPrompt;
@@ -146,6 +160,7 @@ interface AppState {
   readFsDirectoryDebug(path: string): Promise<void>;
   readFsMetadataDebug(path: string): Promise<void>;
   refreshCurrentThreadDetail(threadId: string): Promise<void>;
+  loadOlderTurns(): Promise<void>;
   selectThread(threadId: string): Promise<void>;
   createThread(): Promise<void>;
   sendPrompt(prompt: string): Promise<void>;
@@ -435,6 +450,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedThreadId: null,
   threadDetail: null,
   threadDetailRefreshing: false,
+  threadHistoryHasMore: false,
+  threadHistoryNextBeforeTurnId: null,
+  threadHistoryLoadingMore: false,
   liveDeltas: {},
   activeTurnId: null,
   pendingPrompt: null,
@@ -538,13 +556,27 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ threadDetailRefreshing: true, error: null });
     const request = (async () => {
       try {
-        const detail = await api.threadDetail(threadId);
+        const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? null;
+        const page = await api.threadHistory(threadId, { limit: THREAD_HISTORY_PAGE_SIZE });
         if (latestThreadDetailRequestByThread.get(threadId) !== requestId) {
           return;
         }
         if (get().selectedThreadId !== threadId) {
           return;
         }
+        const resolvedSummary = summary ?? (await api.threadDetail(threadId).catch(() => null));
+        if (!resolvedSummary) {
+          throw new Error(`thread not found: ${threadId}`);
+        }
+        const incomingTurns = normalizeHistoryTurns(page.turns);
+        const currentDetail = get().threadDetail;
+        const detail: ThreadDetail = {
+          ...resolvedSummary,
+          turns:
+            currentDetail?.id === threadId
+              ? mergeThreadTurns(currentDetail.turns, incomingTurns)
+              : incomingTurns
+        };
         debugLog("refreshCurrentThreadDetail.received", {
           threadId,
           turnIds: detail.turns.map((turn) => turn.id),
@@ -554,6 +586,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         set((state) => ({
           threadDetail: detail,
           threadDetailRefreshing: false,
+          threadHistoryHasMore: page.hasMore,
+          threadHistoryNextBeforeTurnId: page.nextBeforeTurnId,
           liveDeltas: pruneLiveDeltasForDetail(state.liveDeltas, detail),
           activeTurnId: detail.turns.find((turn) => turn.status === "inProgress")?.id ?? null,
           pendingPrompt:
@@ -608,11 +642,48 @@ export const useAppStore = create<AppState>((set, get) => ({
     inFlightThreadDetailRequests.set(threadId, request);
     return request;
   },
+  loadOlderTurns: async () => {
+    const threadId = get().selectedThreadId;
+    const beforeTurnId = get().threadHistoryNextBeforeTurnId;
+    const detail = get().threadDetail;
+    if (!threadId || !beforeTurnId || !detail || get().threadHistoryLoadingMore) {
+      return;
+    }
+    set({ threadHistoryLoadingMore: true, error: null });
+    try {
+      const page = await api.threadHistory(threadId, {
+        beforeTurnId,
+        limit: THREAD_HISTORY_PAGE_SIZE
+      });
+      const olderTurns = normalizeHistoryTurns(page.turns);
+      set((state) => {
+        if (state.threadDetail?.id !== threadId) {
+          return { threadHistoryLoadingMore: false };
+        }
+        return {
+          threadDetail: {
+            ...state.threadDetail,
+            turns: mergeThreadTurns(olderTurns, state.threadDetail.turns)
+          },
+          threadHistoryHasMore: page.hasMore,
+          threadHistoryNextBeforeTurnId: page.nextBeforeTurnId,
+          threadHistoryLoadingMore: false
+        };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      set({ threadHistoryLoadingMore: false, error: message });
+      throw error;
+    }
+  },
   selectThread: async (threadId) => {
     set({
       selectedThreadId: threadId,
       threadDetail: null,
       threadDetailRefreshing: true,
+      threadHistoryHasMore: false,
+      threadHistoryNextBeforeTurnId: null,
+      threadHistoryLoadingMore: false,
       activeTurnId: null,
       error: null
     });
@@ -645,6 +716,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       selectedThreadId: thread.id,
       threadDetail: emptyDetailFromSummary(thread),
       threadDetailRefreshing: false,
+      threadHistoryHasMore: false,
+      threadHistoryNextBeforeTurnId: null,
+      threadHistoryLoadingMore: false,
       activeTurnId: null,
       liveDeltas: {}
     });
@@ -735,6 +809,9 @@ export const useAppStore = create<AppState>((set, get) => ({
             selectedThreadId: matchedThread?.id ?? null,
             threadDetail: matchedThread && state.threadDetail?.id === matchedThread.id ? state.threadDetail : null,
             threadDetailRefreshing: matchedThread ? state.threadDetailRefreshing : false,
+            threadHistoryHasMore: matchedThread ? state.threadHistoryHasMore : false,
+            threadHistoryNextBeforeTurnId: matchedThread ? state.threadHistoryNextBeforeTurnId : null,
+            threadHistoryLoadingMore: false,
             activeTurnId: matchedThread?.id ? state.activeTurnId : null,
             liveDeltas: matchedThread?.id ? state.liveDeltas : {}
           }
@@ -748,6 +825,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeSessionId: null,
       threadDetail: null,
       threadDetailRefreshing: false,
+      threadHistoryHasMore: false,
+      threadHistoryNextBeforeTurnId: null,
+      threadHistoryLoadingMore: false,
       activeTurnId: null,
       liveDeltas: {}
     });
