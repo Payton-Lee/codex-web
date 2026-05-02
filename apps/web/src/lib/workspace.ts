@@ -6,7 +6,12 @@ function trimTrailingSeparators(input: string): string {
 }
 
 export function normalizeWorkspacePath(input: string): string {
-  return trimTrailingSeparators(input);
+  const withoutExtendedPrefix =
+    typeof input === "string" && input.startsWith("\\\\?\\") ? input.slice(4) : input;
+  const normalized = trimTrailingSeparators(withoutExtendedPrefix);
+  return typeof window !== "undefined" && normalized.match(/^[a-zA-Z]:[\\/]/)
+    ? normalized.toLowerCase()
+    : normalized;
 }
 
 export function isThreadInWorkspace(threadCwd: string | null | undefined, workspacePath: string | null | undefined): boolean {

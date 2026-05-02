@@ -63,6 +63,13 @@ function isTransientThreadDetailError(message: string): boolean {
   return message.includes("rollout") && message.includes("is empty");
 }
 
+function isThreadNotReadyError(message: string): boolean {
+  return (
+    message.includes("is not materialized yet") ||
+    message.includes("thread not found")
+  );
+}
+
 function readSessionIdFromUrl(): string | null {
   const params = new URLSearchParams(window.location.search);
   const sessionId = params.get(SESSION_QUERY_KEY)?.trim();
@@ -217,6 +224,19 @@ function emptyDetailFromSummary(thread: ThreadSummary): ThreadDetail {
   };
 }
 
+function upsertThreadSummary(threads: ThreadSummary[], thread: ThreadSummary): ThreadSummary[] {
+  const existingIndex = threads.findIndex((entry) => entry.id === thread.id);
+  if (existingIndex >= 0) {
+    const nextThreads = [...threads];
+    nextThreads[existingIndex] = {
+      ...nextThreads[existingIndex],
+      ...thread
+    };
+    return nextThreads;
+  }
+  return [thread, ...threads];
+}
+
 function pruneLiveDeltasForDetail(liveDeltas: DeltaMap, detail: ThreadDetail): DeltaMap {
   const completedItemIds = new Set(
     detail.turns.flatMap((turn) => turn.items.map((item) => item.id))
@@ -261,6 +281,167 @@ function mergeLiveItemText(item: ThreadItem, text: string): ThreadItem {
       item.type === "commandExecution" || item.type === "fileChange"
         ? text
         : item.aggregatedOutput
+  };
+}
+
+function buildOptimisticUserItem(turnId: string, prompt: string): ThreadItem {
+  return {
+    id: `optimistic-user:${turnId}`,
+    type: "userMessage",
+    text: prompt
+  };
+}
+
+function ensureTurn(detail: ThreadDetail, turnId: string, status = "inProgress"): ThreadDetail {
+  if (detail.turns.some((turn) => turn.id === turnId)) {
+    return {
+      ...detail,
+      turns: detail.turns.map((turn) =>
+        turn.id === turnId ? { ...turn, status: turn.status === "completed" ? turn.status : status } : turn
+      )
+    };
+  }
+  return {
+    ...detail,
+    turns: [...detail.turns, { id: turnId, status, items: [] }]
+  };
+}
+
+function upsertTurnItem(turn: TurnSummary, item: ThreadItem): TurnSummary {
+  const existingIndex = turn.items.findIndex((entry) => entry.id === item.id);
+  if (existingIndex >= 0) {
+    const nextItems = [...turn.items];
+    nextItems[existingIndex] = {
+      ...nextItems[existingIndex],
+      ...item,
+      changes: item.changes ?? nextItems[existingIndex].changes,
+      aggregatedOutput: item.aggregatedOutput ?? nextItems[existingIndex].aggregatedOutput ?? null
+    };
+    return { ...turn, items: nextItems };
+  }
+  return { ...turn, items: [...turn.items, item] };
+}
+
+function mergeThreadItemDelta(
+  item: ThreadItem,
+  payload: {
+    stream: "assistant" | "command" | "fileChange" | "reasoning";
+    delta: string;
+  }
+): ThreadItem {
+  const mergedText = `${item.text ?? item.aggregatedOutput ?? ""}${payload.delta}`;
+  return {
+    ...item,
+    text: mergedText,
+    aggregatedOutput:
+      payload.stream === "command" || payload.stream === "fileChange"
+        ? mergedText
+        : item.aggregatedOutput ?? null
+  };
+}
+
+function applyTurnStartedToDetail(
+  detail: ThreadDetail | null,
+  threadId: string,
+  turnId: string,
+  pendingPrompt: PendingPrompt
+): ThreadDetail | null {
+  if (!detail || detail.id !== threadId) {
+    return detail;
+  }
+  const ensured = ensureTurn(detail, turnId, "inProgress");
+  if (!pendingPrompt || pendingPrompt.threadId !== threadId) {
+    return ensured;
+  }
+  return {
+    ...ensured,
+    turns: ensured.turns.map((turn) =>
+      turn.id === turnId && !turn.items.some((item) => item.type === "userMessage")
+        ? { ...turn, items: [buildOptimisticUserItem(turnId, pendingPrompt.prompt), ...turn.items] }
+        : turn
+    )
+  };
+}
+
+function applyItemEventToDetail(
+  detail: ThreadDetail | null,
+  threadId: string,
+  turnId: string,
+  item: ThreadItem
+): ThreadDetail | null {
+  if (!detail || detail.id !== threadId) {
+    return detail;
+  }
+  const ensured = ensureTurn(detail, turnId, "inProgress");
+  return {
+    ...ensured,
+    turns: ensured.turns.map((turn) => {
+      if (turn.id !== turnId) {
+        return turn;
+      }
+      const nextTurn =
+        item.type === "userMessage"
+          ? {
+              ...turn,
+              items: turn.items.filter((entry) => entry.id !== `optimistic-user:${turnId}`)
+            }
+          : turn;
+      return upsertTurnItem(nextTurn, item);
+    })
+  };
+}
+
+function applyItemDeltaToDetail(
+  detail: ThreadDetail | null,
+  payload: {
+    threadId: string;
+    turnId: string;
+    itemId: string;
+    stream: "assistant" | "command" | "fileChange" | "reasoning";
+    delta: string;
+  }
+): ThreadDetail | null {
+  if (!detail || detail.id !== payload.threadId) {
+    return detail;
+  }
+  const ensured = ensureTurn(detail, payload.turnId, "inProgress");
+  return {
+    ...ensured,
+    turns: ensured.turns.map((turn) => {
+      if (turn.id !== payload.turnId) {
+        return turn;
+      }
+      const existingItem =
+        turn.items.find((item) => item.id === payload.itemId) ??
+        ({
+          id: payload.itemId,
+          type:
+            payload.stream === "assistant"
+              ? "agentMessage"
+              : payload.stream === "reasoning"
+                ? "reasoning"
+                : payload.stream === "command"
+                  ? "commandExecution"
+                  : "fileChange"
+        } satisfies ThreadItem);
+      return upsertTurnItem(turn, mergeThreadItemDelta(existingItem, payload));
+    })
+  };
+}
+
+function applyTurnCompletedToDetail(
+  detail: ThreadDetail | null,
+  threadId: string,
+  turnId: string,
+  status: string
+): ThreadDetail | null {
+  if (!detail || detail.id !== threadId) {
+    return detail;
+  }
+  return {
+    ...detail,
+    turns: detail.turns.map((turn) => (turn.id === turnId ? { ...turn, status } : turn)),
+    status: status === "failed" ? "failed" : status === "interrupted" ? "interrupted" : detail.status
   };
 }
 
@@ -556,8 +737,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ threadDetailRefreshing: true, error: null });
     const request = (async () => {
       try {
-        const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? null;
-        const page = await api.threadHistory(threadId, { limit: THREAD_HISTORY_PAGE_SIZE });
+        const currentDetailSummary =
+          get().threadDetail?.id === threadId ? (get().threadDetail as ThreadSummary) : null;
+        const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? currentDetailSummary ?? null;
+        let page;
+        try {
+          page = await api.threadHistory(threadId, { limit: THREAD_HISTORY_PAGE_SIZE });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (summary && isThreadNotReadyError(message)) {
+            page = {
+              threadId,
+              turns: [],
+              hasMore: false,
+              nextBeforeTurnId: null
+            };
+          } else {
+            throw error;
+          }
+        }
         if (latestThreadDetailRequestByThread.get(threadId) !== requestId) {
           return;
         }
@@ -608,8 +806,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           return;
         }
         const message = error instanceof Error ? error.message : String(error);
-        const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? null;
-        if (message.includes("is not materialized yet") && summary) {
+        const currentDetailSummary =
+          get().threadDetail?.id === threadId ? (get().threadDetail as ThreadSummary) : null;
+        const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? currentDetailSummary ?? null;
+        if (isThreadNotReadyError(message) && summary) {
           set((state) => ({
             threadDetail: state.threadDetail?.id === threadId ? state.threadDetail : emptyDetailFromSummary(summary),
             threadDetailRefreshing: false,
@@ -694,8 +894,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       writeSessionIdToUrl(resolvedSession?.sessionId ?? null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? null;
-      if (message.includes("is not materialized yet") && summary) {
+      const currentDetailSummary =
+        get().threadDetail?.id === threadId ? (get().threadDetail as ThreadSummary) : null;
+      const summary = get().snapshot?.threads.find((entry) => entry.id === threadId) ?? currentDetailSummary ?? null;
+      if (isThreadNotReadyError(message) && summary) {
         set((state) => ({
           threadDetail: emptyDetailFromSummary(summary),
           threadDetailRefreshing: false,
@@ -711,8 +913,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   createThread: async () => {
     const thread = await api.createThread();
-    await get().refreshThreads();
-      set({
+    set((state) => ({
+      snapshot: state.snapshot
+        ? {
+            ...state.snapshot,
+            threads: upsertThreadSummary(state.snapshot.threads, thread),
+            loadedThreads: {
+              ...state.snapshot.loadedThreads,
+              loadedThreadIds: state.snapshot.loadedThreads.loadedThreadIds.includes(thread.id)
+                ? state.snapshot.loadedThreads.loadedThreadIds
+                : [thread.id, ...state.snapshot.loadedThreads.loadedThreadIds]
+            }
+          }
+        : state.snapshot,
       selectedThreadId: thread.id,
       threadDetail: emptyDetailFromSummary(thread),
       threadDetailRefreshing: false,
@@ -721,11 +934,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       threadHistoryLoadingMore: false,
       activeTurnId: null,
       liveDeltas: {}
-    });
+    }));
     await get().selectThread(thread.id);
+    void get().refreshThreads();
   },
-  sendPrompt: async (prompt) => {
-    const trimmedPrompt = prompt.trim();
+    sendPrompt: async (prompt) => {
+      const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt) {
       return;
     }
@@ -739,13 +953,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (currentPendingPrompt && currentPendingPrompt.threadId === currentThreadId) {
       return;
     }
-    set({ error: null, pendingPrompt: { threadId: currentThreadId, prompt: trimmedPrompt } });
-    try {
-      const result = await api.sendPrompt(currentThreadId, trimmedPrompt);
-      set({ activeTurnId: result.turnId });
-      scheduleThreadDetailRefresh(currentThreadId);
-      return;
-    } catch (error) {
+      set({ error: null, pendingPrompt: { threadId: currentThreadId, prompt: trimmedPrompt } });
+      try {
+        const result = await api.sendPrompt(currentThreadId, trimmedPrompt);
+        set((state) => ({
+          activeTurnId: result.turnId,
+          pendingPrompt: null,
+          threadDetail: applyTurnStartedToDetail(
+            state.threadDetail,
+            currentThreadId,
+            result.turnId,
+            { threadId: currentThreadId, prompt: trimmedPrompt }
+          )
+        }));
+        scheduleThreadDetailRefresh(currentThreadId, 1200);
+        return;
+      } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       set({
         pendingPrompt: null,
@@ -1029,7 +1252,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   resolveApproval: async (approvalId, payload) => {
     await api.resolveApproval(approvalId, payload);
   },
-  handleEvent: (event) => {
+    handleEvent: (event) => {
     if (event.type === "snapshot") {
       set({ snapshot: event.payload, bootstrapped: true });
       return;
@@ -1180,12 +1403,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (event.type === "item.delta") {
+      if (event.payload.threadId === get().selectedThreadId) {
+        set((state) => ({
+          threadDetail: applyItemDeltaToDetail(state.threadDetail, event.payload)
+        }));
+        return;
+      }
       enqueueLiveDelta(event.payload);
       return;
     }
 
     if (event.type === "turn.started") {
-      set({ activeTurnId: event.payload.turnId });
+      set((state) => ({
+        activeTurnId: event.payload.turnId,
+        threadDetail: applyTurnStartedToDetail(
+          state.threadDetail,
+          event.payload.threadId,
+          event.payload.turnId,
+          state.pendingPrompt
+        )
+      }));
       scheduleThreadListRefresh("loaded", 320);
       return;
     }
@@ -1199,7 +1436,23 @@ export const useAppStore = create<AppState>((set, get) => ({
         itemText: event.payload.item.text ?? null,
         aggregatedOutput: event.payload.item.aggregatedOutput ?? null
       });
-      if (event.payload.item.type !== "userMessage") {
+      const isSelectedThread = event.payload.threadId === get().selectedThreadId;
+      if (isSelectedThread) {
+        set((state) => ({
+          threadDetail: applyItemEventToDetail(
+            state.threadDetail,
+            event.payload.threadId,
+            event.payload.turnId,
+            event.payload.item
+          ),
+          pendingPrompt:
+            state.pendingPrompt &&
+            state.pendingPrompt.threadId === event.payload.threadId &&
+            event.payload.item.type === "userMessage"
+              ? null
+              : state.pendingPrompt
+        }));
+      } else if (event.payload.item.type !== "userMessage") {
         set((state) => ({
           liveDeltas: {
             ...state.liveDeltas,
@@ -1225,11 +1478,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
         }));
       }
-      if (event.payload.threadId === get().selectedThreadId) {
-        if (event.payload.item.type === "userMessage") {
-          scheduleThreadDetailRefresh(event.payload.threadId, 160);
-        }
-      } else {
+      if (!isSelectedThread) {
         scheduleThreadListRefresh("threads", 420);
       }
       return;
@@ -1245,14 +1494,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (event.type === "turn.completed") {
       debugLog("event.turn.completed", event.payload);
       if (event.payload.threadId === get().selectedThreadId) {
-        scheduleThreadDetailRefresh(event.payload.threadId, 120);
+        set((state) => ({
+          activeTurnId: null,
+          threadDetail: applyTurnCompletedToDetail(
+            state.threadDetail,
+            event.payload.threadId,
+            event.payload.turnId,
+            event.payload.status
+          ),
+          pendingPrompt:
+            state.pendingPrompt && state.pendingPrompt.threadId === event.payload.threadId ? null : state.pendingPrompt
+        }));
+        scheduleThreadDetailRefresh(event.payload.threadId, 320);
+      } else {
+        set((state) => ({
+          activeTurnId: null,
+          pendingPrompt:
+            state.pendingPrompt && state.pendingPrompt.threadId === event.payload.threadId ? null : state.pendingPrompt
+        }));
       }
-      set((state) => ({
-        activeTurnId: null,
-        liveDeltas: state.liveDeltas,
-        pendingPrompt:
-          state.pendingPrompt && state.pendingPrompt.threadId === event.payload.threadId ? null : state.pendingPrompt
-      }));
       scheduleThreadListRefresh("loaded", 180);
       return;
     }

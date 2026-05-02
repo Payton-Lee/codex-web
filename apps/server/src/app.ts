@@ -11,6 +11,7 @@ import {
   ApprovalRequest,
   ApprovalResolution,
   DiffPreview,
+  FileChangeEntry,
   FrontendEvent,
   LoadedThreadsSummary,
   McpComposerSuggestions,
@@ -166,6 +167,16 @@ function isThreadNotMaterializedError(error: unknown): boolean {
 function isThreadNotFoundError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes("thread not found");
+}
+
+function buildDiffPreviewsFromTurnItems(items: Array<{ type?: string; changes?: unknown }>): DiffPreview[] {
+  return items
+    .filter((item) => item.type === "fileChange")
+    .flatMap((item) =>
+      Array.isArray(item.changes)
+        ? item.changes.map((change) => buildDiffPreview(change as FileChangeEntry))
+        : []
+    );
 }
 
 function isAppServerUnavailableError(error: unknown): boolean {
@@ -2020,7 +2031,31 @@ const codexThreadStore = new CodexThreadStore(appConfig.workspaceDbPath, appConf
       res.json(page satisfies ThreadHistoryPage);
       return;
     }
-    res.status(404).json({ error: `thread not found: ${req.params.threadId}` });
+    await ensureClientReady();
+    try {
+      await client.request<any>("thread/read", {
+        threadId: req.params.threadId,
+        includeTurns: false
+      });
+      res.json({
+        threadId: req.params.threadId,
+        turns: [],
+        hasMore: false,
+        nextBeforeTurnId: null
+      } satisfies ThreadHistoryPage);
+      return;
+    } catch (error) {
+      if (isThreadNotMaterializedError(error) || isThreadNotFoundError(error)) {
+        res.json({
+          threadId: req.params.threadId,
+          turns: [],
+          hasMore: false,
+          nextBeforeTurnId: null
+        } satisfies ThreadHistoryPage);
+        return;
+      }
+      throw error;
+    }
   });
 
   app.post("/api/threads/:threadId/turns", async (req, res) => {
@@ -2348,20 +2383,41 @@ const codexThreadStore = new CodexThreadStore(appConfig.workspaceDbPath, appConf
     if (!requireOrigin(req, res)) {
       return;
     }
-    await ensureClientReady();
-    const response = await client.request<any>("thread/read", {
-      threadId: req.params.threadId,
-      includeTurns: true
-    });
-    const turn = (response.thread.turns ?? []).find((entry: any) => entry.id === req.params.turnId);
-    const fileChanges = (turn?.items ?? []).filter((item: any) => item.type === "fileChange");
-    const previews: DiffPreview[] = fileChanges.flatMap((item: any) =>
-      (item.changes ?? []).map(buildDiffPreview)
+    const cachedDetail = codexThreadStore.readThreadDetail(
+      req.params.threadId,
+      turnStatusByThread.get(req.params.threadId) ?? "idle"
     );
-    res.json({
-      diff: turnDiffs.get(`${req.params.threadId}:${req.params.turnId}`) ?? "",
-      previews
-    });
+    const cachedTurn = cachedDetail?.turns.find((entry) => entry.id === req.params.turnId) ?? null;
+    if (cachedTurn) {
+      res.json({
+        diff: turnDiffs.get(`${req.params.threadId}:${req.params.turnId}`) ?? "",
+        previews: buildDiffPreviewsFromTurnItems(cachedTurn.items)
+      });
+      return;
+    }
+
+    await ensureClientReady();
+    try {
+      const response = await client.request<any>("thread/read", {
+        threadId: req.params.threadId,
+        includeTurns: true
+      });
+      const turn = (response.thread.turns ?? []).find((entry: any) => entry.id === req.params.turnId);
+      res.json({
+        diff: turnDiffs.get(`${req.params.threadId}:${req.params.turnId}`) ?? "",
+        previews: buildDiffPreviewsFromTurnItems(turn?.items ?? [])
+      });
+      return;
+    } catch (error) {
+      if (isThreadNotMaterializedError(error) || isThreadNotFoundError(error)) {
+        res.json({
+          diff: turnDiffs.get(`${req.params.threadId}:${req.params.turnId}`) ?? "",
+          previews: []
+        });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.get("/api/approvals", (req, res) => {

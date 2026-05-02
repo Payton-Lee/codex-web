@@ -28,7 +28,7 @@ import { ThreadSidebar } from "./components/ThreadSidebar";
 import { WorkspaceSelector } from "./components/WorkspaceSelector";
 import { useAppStore } from "./store";
 import { cn } from "./lib/utils";
-import { isThreadInWorkspace } from "./lib/workspace";
+import { isThreadInWorkspace, normalizeWorkspacePath } from "./lib/workspace";
 import type { SlashCommandId } from "./lib/composer";
 
 type RightTab = "diff" | "approvals" | "settings";
@@ -294,7 +294,8 @@ export default function App() {
 
   const currentWorkspace = snapshot.workspace.current;
   const workspaceLabel = currentWorkspace ?? threadDetail?.cwd;
-  const projectName = workspaceLabel ? workspaceLabel.split("/").pop() : t.notSelected;
+  const normalizedWorkspaceLabel = workspaceLabel ? normalizeWorkspacePath(workspaceLabel) : null;
+  const projectName = normalizedWorkspaceLabel ? normalizedWorkspaceLabel.split(/[\\/]/).pop() : t.notSelected;
   const accountName = snapshot.account.email?.split("@")[0] || "Codex User";
   const rateLimits = snapshot.account.rateLimits;
   const formatResetAt = (resetsAt?: number | null) =>
@@ -656,7 +657,9 @@ export default function App() {
             <span className="text-text-secondary">{t.currentWorkspace}:</span>
             <span className="font-medium text-accent truncate">{projectName}</span>
             <span className="text-border mx-2">|</span>
-            <span className="text-text-secondary truncate max-w-[200px] hidden sm:inline">{workspaceLabel}</span>
+            <span className="text-text-secondary truncate max-w-[200px] hidden sm:inline">
+              {normalizedWorkspaceLabel ?? t.notSelected}
+            </span>
           </div>
 
           <div className="flex items-center gap-4">
